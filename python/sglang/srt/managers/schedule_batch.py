@@ -626,6 +626,7 @@ class Req:
         tree_cache: Optional[BasePrefixCache] = None,
         enable_hierarchical_cache=False,
     ):
+
         self.fill_ids = self.origin_input_ids + self.output_ids
         if tree_cache is not None:
             # tree cache is None if the prefix is not computed with tree cache.
@@ -1654,9 +1655,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     if self.spec_info
                     else CaptureHiddenMode.NULL
                 )
-        # print(f"capture_hidden_mode get_model_worker_batch: {capture_hidden_mode.name},")
-        # if self.spec_info:
-        #     print(f"self.spec_info.capture_hidden_mode: {self.spec_info.capture_hidden_mode.name}")
 
         global bid
         bid += 1

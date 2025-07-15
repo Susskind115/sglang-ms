@@ -500,10 +500,10 @@ if __name__ == "__main__":
     tree = RadixCache(None, None, page_size=1, disable=False)
 
     tree.insert("Hello")
-    tree.insert("Hello")
+    tree.insert("Hell")
     tree.insert("Hello_L.A.!")
-    # tree.insert("Hello_world! Happy")
-    # tree.insert("I love you!")
+    tree.insert("Hello_world! Happy")
+    tree.insert("I love you!")
     tree.pretty_print()
 
     # print(tree.match_prefix("I love you! aha"))

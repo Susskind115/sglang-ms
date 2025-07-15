@@ -195,6 +195,8 @@ class CudaGraphRunner:
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.enable_dp_attention = model_runner.server_args.enable_dp_attention
         self.enable_sp_layernorm = model_runner.server_args.enable_sp_layernorm
+        self.capture_hidden_mode = model_runner.server_args.capture_hidden_mode
+        print(f"CudaGraphRunner capture_hidden_mode: {self.capture_hidden_mode.name}")
         self.spec_flag = model_runner.spec_flag
         # self.speculative_algorithm = model_runner.server_args.speculative_algorithm
         self.tp_size = model_runner.server_args.tp_size
@@ -205,7 +207,7 @@ class CudaGraphRunner:
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         rank0_log(f"Capture cuda graph bs {self.capture_bs}")
         self.capture_forward_mode = ForwardMode.DECODE
-        self.capture_hidden_mode = CaptureHiddenMode.NULL
+        # self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
         # if model_runner.spec_algorithm.is_eagle():
         if self.spec_flag:
@@ -435,10 +437,10 @@ class CudaGraphRunner:
             gathered_buffer = None
 
         spec_info = self.get_spec_info(num_tokens)
-        if self.capture_hidden_mode != CaptureHiddenMode.FULL:
-            self.capture_hidden_mode = (
-                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
-            )
+        # if self.capture_hidden_mode != CaptureHiddenMode.FULL:
+        #     self.capture_hidden_mode = (
+        #         spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
+        #     )
         if self.model_runner.server_args.lora_paths is not None:
             # Currently, if the lora_path in `lora_paths` is None, the lora backend will use a
             # different logic to handle lora, so we need to set `lora_paths` to a list of non-None
@@ -658,7 +660,8 @@ class CudaGraphRunner:
                     retrive_cum_len=None,
                     draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
                     spec_steps=self.model_runner.server_args.speculative_num_steps,
-                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    capture_hidden_mode=self.capture_hidden_mode,
+                    # capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
 
         

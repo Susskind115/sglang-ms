@@ -110,6 +110,7 @@ class TpModelWorker:
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
         self.gpu_id = gpu_id
+        self.model_name = server_args.model_path
         self.spec_flag = spec_flag
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
@@ -163,6 +164,21 @@ class TpModelWorker:
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             defer_memory_init=defer_memory_init,
         )
+
+        # Load hot token ids
+        if self.speculative_algorithm.is_eagle3():
+            if server_args.speculative_token_map is not None:
+                logger.warning(
+                    "Speculative token map specified, but EAGLE3 models already have this. Ignoring the specified token map."
+                )
+            self.hot_token_id = None
+        elif server_args.speculative_token_map is not None:
+            self.hot_token_id = load_token_map(server_args.speculative_token_map)
+            server_args.json_model_override_args = (
+                f'{{"hot_vocab_size": {len(self.hot_token_id)}}}'
+            )
+        else:
+            self.hot_token_id = None
 
         # self.post_init_model_runner(server_args, defer_memory_init)
 
@@ -367,20 +383,20 @@ class TpModelWorker:
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        # Load hot token ids
-        if self.speculative_algorithm.is_eagle3():
-            if server_args.speculative_token_map is not None:
-                logger.warning(
-                    "Speculative token map specified, but EAGLE3 models already have this. Ignoring the specified token map."
-                )
-            self.hot_token_id = None
-        elif server_args.speculative_token_map is not None:
-            self.hot_token_id = load_token_map(server_args.speculative_token_map)
-            server_args.json_model_override_args = (
-                f'{{"hot_vocab_size": {len(self.hot_token_id)}}}'
-            )
-        else:
-            self.hot_token_id = None
+        # # Load hot token ids
+        # if self.speculative_algorithm.is_eagle3():
+        #     if server_args.speculative_token_map is not None:
+        #         logger.warning(
+        #             "Speculative token map specified, but EAGLE3 models already have this. Ignoring the specified token map."
+        #         )
+        #     self.hot_token_id = None
+        # elif server_args.speculative_token_map is not None:
+        #     self.hot_token_id = load_token_map(server_args.speculative_token_map)
+        #     server_args.json_model_override_args = (
+        #         f'{{"hot_vocab_size": {len(self.hot_token_id)}}}'
+        #     )
+        # else:
+        #     self.hot_token_id = None
 
     def init_draft_backend_and_cuda_graphs(self):
         # Init draft attention backend and cuda graph runner
@@ -596,8 +612,9 @@ class TpModelWorker:
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
 
         # Get forward batch
-        spec_info.capture_hidden_mode = self.check_capture_hidden_mode(self.speculative_algorithm)
-        
+        # spec_info.capture_hidden_mode = self.check_capture_hidden_mode(self.speculative_algorithm)
+        spec_info.capture_hidden_mode = self.model_runner.server_args.capture_hidden_mode
+
         model_worker_batch = batch.get_model_worker_batch()
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.model_runner
@@ -676,6 +693,7 @@ class TpModelWorker:
             forward_batch.positions.add_(1)
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
+            
 
             # Run forward
             logits_output = self.model_runner.model.forward(
@@ -694,8 +712,9 @@ class TpModelWorker:
     def forward_draft_extend(
         self,
         batch: ScheduleBatch,
-        hidden_states: torch.Tensor,
-        next_token_ids: List[int],
+        # hidden_states: torch.Tensor,
+        # next_token_ids: List[int],
+
     ):
         """Run draft model extend. This API modifies the states of the batch.
 
@@ -705,14 +724,12 @@ class TpModelWorker:
             next_token_ids: Next token ids generated from the target forward.
         """
         # logger.info(f"going from TPWorker.forward_draft_extend")
-        batch.spec_info = EagleDraftInput(
-            hidden_states=hidden_states,
-            verified_id=next_token_ids,
-        )
+        
         batch.spec_info.prepare_for_extend(batch)
         # batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        batch.spec_info.capture_hidden_mode = self.check_capture_hidden_mode(self.speculative_algorithm)
+        # batch.spec_info.capture_hidden_mode = self.check_capture_hidden_mode(self.speculative_algorithm)
         model_worker_batch = batch.get_model_worker_batch()
+
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.model_runner
         )
@@ -721,7 +738,8 @@ class TpModelWorker:
         self._detect_nan_if_needed(logits_output)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
-        self.capture_for_decode(logits_output, forward_batch.spec_info)
+        # self.capture_for_decode(logits_output, forward_batch.spec_info)
+        return logits_output, None, model_worker_batch.bid
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         # Backup fields that will be modified in-place
@@ -738,6 +756,7 @@ class TpModelWorker:
         )
         # batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         batch.spec_info.capture_hidden_mode = self.check_capture_hidden_mode(self.speculative_algorithm)
+        # batch.spec_info.capture_hidden_mode = capture_hidden_mode
         batch.return_logprob = False
         model_worker_batch = batch.get_model_worker_batch()
         forward_batch = ForwardBatch.init_new(
@@ -782,6 +801,16 @@ class TpModelWorker:
         else:
             raise ValueError(f"Invalid speculative algorithm: {speculative_algorithm}")
         return capture_hidden_mode
+
+    # def check_binary_capture_hidden_mode(self, draft_speculative_algorithm: SpeculativeAlgorithm, target_speculative_algorithm: SpeculativeAlgorithm):
+    #     capture_hidden_mode = CaptureHiddenMode.NULL
+    #     if draft_speculative_algorithm.is_eagle3() or target_speculative_algorithm.is_eagle3():
+    #         capture_hidden_mode = CaptureHiddenMode.FULL
+    #     elif draft_speculative_algorithm.is_eagle() or target_speculative_algorithm.is_eagle():
+    #         capture_hidden_mode = CaptureHiddenMode.LAST
+    #     else:
+    #         capture_hidden_mode = CaptureHiddenMode.NULL
+    #     return capture_hidden_mode
 
 
 ##################### target forward zone ######################
@@ -931,7 +960,10 @@ class TpModelWorker:
         # We need the full hidden states to prefill the KV cache of the draft model.
         model_worker_batch = batch.get_model_worker_batch()
         # model_worker_batch.capture_hidden_mode = CaptureHiddenMode.NULL
-        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        # TODO: one static config
+        if batch.spec_info.capture_hidden_mode.need_capture():
+            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        # model_worker_batch.capture_hidden_mode = capture_hidden_mode
         logits_output, next_token_ids, _ = self.forward_batch_generation(
             model_worker_batch
         )

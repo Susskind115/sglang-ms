@@ -93,7 +93,7 @@ class LlamaModel(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
-
+        
         hidden_states = self.fc(
             torch.cat((hidden_states, forward_batch.spec_info.hidden_states), dim=-1)
         )

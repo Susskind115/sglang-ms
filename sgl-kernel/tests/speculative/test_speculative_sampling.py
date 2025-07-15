@@ -111,6 +111,9 @@ def test_tree_speculative_sampling_target_only(
         threshold_acc=threshold_acc,
         deterministic=True,
     )
+    print(f"predicts: {predicts.tolist()}")
+    print(f"accept_index: {accept_index.tolist()}")
+    print(f"accept_token_num: {accept_token_num.tolist()}")
 
     assert (
         predicts.tolist() == expected_predicts
@@ -125,3 +128,51 @@ def test_tree_speculative_sampling_target_only(
 
 if __name__ == "__main__":
     pytest.main([__file__])
+
+
+"""
+
+void tree_speculative_sampling_target_only(
+    at::Tensor predicts,
+    at::Tensor accept_index,
+    at::Tensor accept_token_num,  // mutable
+    at::Tensor candidates,
+    at::Tensor retrive_index,
+    at::Tensor retrive_next_token,
+    at::Tensor retrive_next_sibling,
+    at::Tensor uniform_samples,
+    at::Tensor target_probs,
+    at::Tensor draft_probs,
+    double threshold_single,
+    double threshold_acc,
+    bool deterministic = true,
+    int64_t cuda_stream = 0) {
+	
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  cudaError_t status = sampling::TreeSpeculativeSamplingTargetOnly<float, int>(
+      static_cast<int*>(predicts.data_ptr()),
+      static_cast<int*>(accept_index.data_ptr()),
+      static_cast<int*>(accept_token_num.data_ptr()),
+      static_cast<int*>(candidates.data_ptr()),
+      static_cast<int*>(retrive_index.data_ptr()),
+      static_cast<int*>(retrive_next_token.data_ptr()),
+      static_cast<int*>(retrive_next_sibling.data_ptr()),
+      static_cast<float*>(uniform_samples.data_ptr()),
+      static_cast<float*>(target_probs.data_ptr()),
+      static_cast<float*>(draft_probs.data_ptr()),
+      batch_size,
+      num_spec_step,
+      num_draft_tokens,
+      vocab_size,
+      static_cast<float>(threshold_single),
+      static_cast<float>(threshold_acc),
+      deterministic,
+      stream);
+
+  TORCH_CHECK(
+      status == cudaSuccess,
+      "TreeSpeculativeSamplingTargetOnly failed with error code " + std::string(cudaGetErrorString(status)));
+}
+
+
+"""

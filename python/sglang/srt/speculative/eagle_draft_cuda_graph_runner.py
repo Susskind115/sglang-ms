@@ -76,25 +76,29 @@ class EAGLEDraftCudaGraphRunner:
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             self.topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
-            self.hidden_states = torch.zeros(
-                (self.max_bs, self.model_runner.model_config.hidden_size),
-                dtype=self.model_runner.dtype,
-            )
+            self.hidden_states = None
+            capture_hidden_mode = self.eagle_worker.model_runner.server_args.capture_hidden_mode
+            if capture_hidden_mode.need_capture():
+                self.hidden_states = torch.zeros(
+                    (self.max_bs, self.model_runner.model_config.hidden_size),
+                    dtype=self.model_runner.dtype,
+                )
+                
 
         # Capture
-        try:
-            self.capture()
-        except RuntimeError as e:
-            raise Exception(
-                f"Capture CUDA graph failed: {e}\n"
-                "Possible solutions:\n"
-                "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
-                "2. set --cuda-graph-max-bs to a smaller value (e.g., 16)\n"
-                "3. disable torch compile by not using --enable-torch-compile\n"
-                "4. disable CUDA graph by --disable-cuda-graph. (Not recommended. Huge performance loss)\n"
-                "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
-            )
-        # self.capture()
+        # try:
+        #     self.capture()
+        # except RuntimeError as e:
+        #     raise Exception(
+        #         f"Capture CUDA graph failed: {e}\n"
+        #         "Possible solutions:\n"
+        #         "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
+        #         "2. set --cuda-graph-max-bs to a smaller value (e.g., 16)\n"
+        #         "3. disable torch compile by not using --enable-torch-compile\n"
+        #         "4. disable CUDA graph by --disable-cuda-graph. (Not recommended. Huge performance loss)\n"
+        #         "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
+        #     )
+        self.capture()
 
     def can_run(self, forward_batch: ForwardBatch):
         is_bs_supported = (
@@ -111,6 +115,8 @@ class EAGLEDraftCudaGraphRunner:
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
         num_tokens = num_seqs * self.num_tokens_per_bs
+        # capture_hidden_mode = self.eagle_worker.check_capture_hidden_mode(self.eagle_worker.speculative_algorithm)
+        capture_hidden_mode = self.eagle_worker.model_runner.server_args.capture_hidden_mode
 
         # Graph inputs
         req_pool_indices = self.req_pool_indices[:num_seqs]
@@ -119,13 +125,16 @@ class EAGLEDraftCudaGraphRunner:
         positions = self.positions[:num_tokens]
         topk_p = self.topk_p[:num_seqs]
         topk_index = self.topk_index[:num_seqs]
-        hidden_states = self.hidden_states[:num_seqs]
+        hidden_states = None
+        if capture_hidden_mode.need_capture():
+            hidden_states = self.hidden_states[:num_seqs]
 
         # logger.info(f"going from capture_one_batch_size")
         spec_info = EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
             hidden_states=hidden_states,
+            capture_hidden_mode=capture_hidden_mode,
         )
 
         # Forward batch

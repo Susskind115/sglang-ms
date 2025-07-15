@@ -8,12 +8,14 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 from huggingface_hub import snapshot_download
+from torch.distributed import get_rank
 
 # from sglang.srt.distributed import GroupCoordinator, patch_tensor_parallel_group
 # from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
 # from sglang.srt.layers.dp_attention import disable_dp_size
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.speculative.eagle_utils import EagleDraftInput
 
 from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
@@ -26,6 +28,8 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 # from sglang_lib.tp_worker import TpModelWorker
 # from sglang.srt.model_executor.forward_batch_info import (
 #     CaptureHiddenMode,
@@ -54,6 +58,84 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 
+class ModelRouter:
+    def __init__(self,  **kwargs):
+        self.hidden_states_dict = {}
+        self.model_verify = {}
+        self.model_draft = {}
+        self.model_capture_hidden_mode = {}
+        self.cur_running_model = None
+        self.last_running_model = None
+        self.router_chain = []
+
+    def set_hidden_states(self, model_name: str, hidden_states: torch.Tensor):
+        self.hidden_states_dict[model_name] = hidden_states
+
+    def get_hidden_states(self, model_name: str):
+        return self.hidden_states_dict[model_name]
+    
+    # def init_model_capture_hidden_mode(self, model_attr_list: List[Tuple[str, str]]):
+    #     last_speculative_algorithm = SpeculativeAlgorithm.from_string(model_attr_list[0][1])
+    #     for model_name, speculative_algorithm_str in model_attr_list:
+    #         speculative_algorithm = SpeculativeAlgorithm.from_string(speculative_algorithm_str)
+    #         self.model_capture_hidden_mode[model_name] = self.check_capture_hidden_mode(last_speculative_algorithm)
+    #         last_speculative_algorithm = speculative_algorithm
+    #     # if get_rank() == 0:
+    #     #     logger.info(f"model_capture_hidden_mode: {self.model_capture_hidden_mode}")
+
+    def init_model_capture_hidden_mode(self, server_args_list: List[ServerArgs]):
+        last_speculative_algorithm = SpeculativeAlgorithm.from_string(server_args_list[0].speculative_algorithm)
+        for server_args in server_args_list:
+            speculative_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+            self.model_capture_hidden_mode[server_args.model_path] = self.check_capture_hidden_mode(last_speculative_algorithm)
+            server_args.capture_hidden_mode = self.model_capture_hidden_mode[server_args.model_path]
+            last_speculative_algorithm = speculative_algorithm
+        return server_args_list
+        # if get_rank() == 0:
+        #     logger.info(f"model_capture_hidden_mode: {self.model_capture_hidden_mode}")
+
+    def update_router_chain_mock(self, model_attr_list: List[Tuple[str, SpeculativeAlgorithm]]):
+        self.set_router_chain(model_attr_list)
+
+    def set_router_chain(self, router_chain: List[Tuple[str, SpeculativeAlgorithm]]):
+        # draft1-draft2-draft……-target
+        self.router_chain = router_chain
+        self.model_verify[router_chain[-1][0]] = None
+        # self.model_draft[router_chain[0]] = None
+        last_model_name = None
+        
+        # last_model_name = router_chain[0]
+        for i, (model_name, _) in enumerate(router_chain):
+            self.model_draft[model_name] = last_model_name
+            if last_model_name is not None:
+                self.model_verify[last_model_name] = model_name
+            last_model_name = model_name
+        
+    
+    def reset_running_model(self):
+        self.cur_running_model = self.router_chain[0]
+        self.last_running_model = None
+        self.hidden_states_dict = {}
+    
+    def to_next_model(self):
+        self.last_running_model = self.cur_running_model
+        self.cur_running_model = self.model_verify[self.cur_running_model]
+        return self.cur_running_model
+    
+    def check_capture_hidden_mode(self, speculative_algorithm: SpeculativeAlgorithm):
+        capture_hidden_mode = None
+        if speculative_algorithm.is_eagle2():
+            capture_hidden_mode = CaptureHiddenMode.LAST
+        elif speculative_algorithm.is_eagle3():
+            capture_hidden_mode = CaptureHiddenMode.FULL
+        elif speculative_algorithm.is_not_eagle():
+            capture_hidden_mode = CaptureHiddenMode.NULL
+            # capture_hidden_mode = CaptureHiddenMode.LAST
+        else:
+            raise ValueError(f"Invalid speculative algorithm: {speculative_algorithm}")
+        return capture_hidden_mode
+
+
 class ModelHub:
     def __init__(self, server_args_list: List[ServerArgs], router_args: dict,
                  main_worker_kargs: dict,
@@ -64,7 +146,7 @@ class ModelHub:
         self.spec_worker = None
         self.defer_memory_init = True
         self.router_args = router_args
-        
+        self.model_router = ModelRouter()
 
         # 动态切换配置：(autoregressive_limit, speculative_limit)
         # self.running_requests_limit = (4097, 256)
@@ -100,7 +182,7 @@ class ModelHub:
             TpWorkerClass = TpModelWorkerClient
         else:
             TpWorkerClass = TpModelWorker
-        print("来！ modelhub")
+        # print("来！ modelhub")
 
         # if orchestration_strategy == "speculative":
         #     # # params
@@ -141,7 +223,11 @@ class ModelHub:
             # self.set_inference_mode("speculative")
 
         # model hub
-        self.model_workers = self.init_workers(server_args_list, main_worker_kargs, TpWorkerClass)
+        selected_server_args_list_mock = server_args_list[:]
+        model_attr_list = [(server_args.model_path, server_args.speculative_algorithm) for server_args in selected_server_args_list_mock]
+        selected_server_args_list_mock = self.model_router.init_model_capture_hidden_mode(selected_server_args_list_mock)
+        self.model_workers = self.init_workers(selected_server_args_list_mock, main_worker_kargs, TpWorkerClass)
+        self.model_router.update_router_chain_mock(model_attr_list)
 
 
     def init_model_configs(self, server_args_list: List[ServerArgs]):
@@ -471,10 +557,12 @@ class ModelHub:
         # else:
         #     self.set_inference_mode("speculative")
         #     batch.spec_flag = True
+        # logger.info(f"forward_batch, current_mode: {self.current_mode}")
             
         if self.current_mode == "speculative":
             # print("forward_batch_speculative_generation")
-            return self.forward_batch_speculative_generation(batch)
+            # return self.forward_batch_speculative_generation(batch)
+            return self.forward_batch_multi_speculative_generation(batch)
         elif self.current_mode == "autoregressive":
             # print("forward_batch_autoregressive_generation")
             return self.forward_batch_autoregressive_generation(batch)
@@ -522,6 +610,10 @@ class ModelHub:
             # logger.info(f"batch_size{batch.batch_size()}, forward_decode")
             with draft_worker.draft_tp_context(draft_worker.model_runner.tp_group):
                 spec_info = draft_worker.draft(batch)
+
+                # retrive_next_token, retrive_next_sibling, retrive_index = spec_info.retrive_next_token.to("cpu").tolist(), spec_info.retrive_next_sibling.to("cpu").tolist(), spec_info.retrive_index.to("cpu").tolist()
+                # if get_rank() == 0:
+                #     logger.info(f"retrive_next_token: {retrive_next_token}, retrive_next_sibling: {retrive_next_sibling}")
             # logger.info(f" forward_verify")
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 target_worker.verify(batch, spec_info)
@@ -559,4 +651,124 @@ class ModelHub:
             # logger.info(f"batch_size{batch.batch_size()}, spec_info:{batch.spec_info}, forward_draft_extend prefill done")
             return logits_output, next_token_ids, bid, 0, False
 
+
     
+    def forward_batch_multi_speculative_generation(
+        self, batch: ScheduleBatch
+    ) -> Tuple[LogitsProcessorOutput, List[int], int, int, bool]:
+        """Run speculative decoding forward.
+
+        NOTE: Many states of batch is modified as you go through. It is not guaranteed that
+        the final output batch have the same state as the input.
+
+        Args:
+            batch: The batch to run forward. The state of the batch is modified as it runs.
+        Returns:
+            A tuple of the final logit output of the target model, next tokens accepted,
+            the batch id (used for overlap schedule), and number of accepted tokens.
+        """
+        draft_worker, target_worker = self.model_workers[0], self.model_workers[-1]
+        mid_worker = self.model_workers[1] if len(self.model_workers) > 2 else None
+        # print("forward_speculative_generation", batch.forward_mode.name)
+        if batch.forward_mode.is_decode():
+            # logger.info(f"batch_size{batch.batch_size()}, forward_decode")
+            
+            with draft_worker.draft_tp_context(draft_worker.model_runner.tp_group):
+                spec_info = draft_worker.draft(batch)
+
+                # retrive_next_token, retrive_next_sibling, retrive_index = spec_info.retrive_next_token.to("cpu").tolist(), spec_info.retrive_next_sibling.to("cpu").tolist(), spec_info.retrive_index.to("cpu").tolist()
+                # if get_rank() == 0:
+                #     logger.info(f"retrive_next_token: {retrive_next_token}, retrive_next_sibling: {retrive_next_sibling}")
+            # logger.info(f" forward_verify")
+            # if get_rank() == 0:
+            #     if batch.spec_info is not None and batch.spec_info.hidden_states is not None:
+            #         print(f"output draft batch.hidden_states: {batch.spec_info.hidden_states.shape}, {batch.spec_info.capture_hidden_mode.name}")
+            #     else:
+            #         print(f"outputNone draft batch.hidden_states: None, {batch.spec_info.capture_hidden_mode.name}")
+            logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
+                target_worker.verify(batch, spec_info)
+            )
+            # if get_rank() == 0:
+            #     if batch.spec_info is not None and batch.spec_info.hidden_states is not None:
+            #         print(f"output verify batch.hidden_states: {batch.spec_info.hidden_states.shape}, {batch.spec_info.capture_hidden_mode.name}")
+            #     else:
+            #         print(f"outputNone verify batch.hidden_states: None, {batch.spec_info.capture_hidden_mode.name}")
+            # logger.info(f"logits_output: {logits_output}, verify_output: {verify_output}, model_worker_batch: {model_worker_batch}")
+
+            # If it is None, it means all requests are finished
+            if batch.spec_info.verified_id is not None:
+                with draft_worker.draft_tp_context(draft_worker.model_runner.tp_group):
+                    draft_worker.forward_draft_extend_after_decode(batch)
+            # if get_rank() == 0:
+            #     if batch.spec_info is not None and batch.spec_info.hidden_states is not None:
+            #         print(f"output draft_after_decode batch.hidden_states: {batch.spec_info.hidden_states.shape}, {batch.spec_info.capture_hidden_mode.name}")
+            #     else:
+            #         print(f"outputNone draft_after_decode batch.hidden_states: None, {batch.spec_info.capture_hidden_mode.name}")
+            return (
+                logits_output,
+                verify_output.verified_id,
+                model_worker_batch.bid,
+                sum(verify_output.accept_length_per_req_cpu),
+                can_run_cuda_graph,
+            )
+        elif batch.forward_mode.is_idle():
+            # logger.info(f"batch_size{batch.batch_size()}, forward_idle")
+            model_worker_batch = batch.get_model_worker_batch()
+            # logits_output, next_token_ids, _ = (
+            #     target_worker.forward_batch_generation(model_worker_batch)
+            # )
+
+            # return logits_output, next_token_ids, model_worker_batch.bid, 0, False
+            return self.forward_batch_autoregressive_generation(batch)
+        else:
+            # logger.info(f"batch_size{batch.batch_size()}, spec_info:{batch.spec_info}, forward_target_and_draft_extend prefill")
+            batch.spec_info = EagleDraftInput(
+                capture_hidden_mode=self.model_router.model_capture_hidden_mode[target_worker.model_name]
+            )
+            logits_output, next_token_ids, bid = target_worker.forward_target_extend(batch)
+            # logger.info(f"batch_size{batch.batch_size()}, spec_info:{batch.spec_info}, forward_target_extend prefill done")
+            # for sub_worker in self.model_workers[:-1]:
+            #     batch.spec_info = EagleDraftInput(
+            #         hidden_states=logits_output.hidden_states,
+            #         verified_id=next_token_ids,
+            #         capture_hidden_mode=self.model_router.model_capture_hidden_mode[draft_worker.model_name]
+            #     )
+            #     with sub_worker.draft_tp_context(sub_worker.model_runner.tp_group):
+            #         sub_worker.forward_draft_extend(
+            #             batch, logits_output.hidden_states, next_token_ids
+            #         )
+            
+            with draft_worker.draft_tp_context(draft_worker.model_runner.tp_group):
+                batch.spec_info = EagleDraftInput(
+                    hidden_states=logits_output.hidden_states,
+                    verified_id=next_token_ids,
+                    capture_hidden_mode=self.model_router.model_capture_hidden_mode[draft_worker.model_name]
+                )
+                logits_output_draft, _, bid_draft = draft_worker.forward_draft_extend(
+                    batch
+                )
+                draft_worker.capture_for_decode(logits_output_draft, batch.spec_info)
+                # draft_worker.forward_draft_extend(
+                #     batch, logits_output.hidden_states, next_token_ids
+                # )
+                # draft_worker.capture_for_decode(logits_output_draft, batch.spec_info)
+            # logger.info(f"batch_size{batch.batch_size()}, spec_info:{batch.spec_info}, forward_draft_extend prefill done")
+            return logits_output, next_token_ids, bid, 0, False
+
+
+
+
+if __name__ == "__main__":
+    model_router = ModelRouter()
+    model_router.update_router_chain_mock(["model1", "model2", "model3"])
+    draft1_state = torch.randn(10, 100)
+    draft2_state = torch.randn(10, 728)
+    draft3_state = torch.randn(10, 1024)
+    model_router.set_hidden_states("model1", draft1_state)
+    model_router.set_hidden_states("model2", draft2_state)
+    model_router.set_hidden_states("model3", draft3_state)
+    print(model_router.get_hidden_states("model1").shape)
+    print(model_router.get_hidden_states("model2").shape)
+    print(model_router.get_hidden_states("model3").shape)
+    print(model_router.model_draft)
+    print(model_router.model_verify)

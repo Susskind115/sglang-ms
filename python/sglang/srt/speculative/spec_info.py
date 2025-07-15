@@ -13,6 +13,9 @@ class SpeculativeAlgorithm(IntEnum):
     def is_eagle(self):
         return self == SpeculativeAlgorithm.EAGLE or self == SpeculativeAlgorithm.EAGLE3
 
+    def is_eagle2(self):
+        return self == SpeculativeAlgorithm.EAGLE
+
     def is_eagle3(self):
         return self == SpeculativeAlgorithm.EAGLE3
 
@@ -21,6 +24,14 @@ class SpeculativeAlgorithm(IntEnum):
 
     def is_normal(self):
         return self == SpeculativeAlgorithm.NORMAL
+
+    def __or__(self, other):
+        if self.is_eagle3() or other.is_eagle3():
+            return SpeculativeAlgorithm.EAGLE3
+        elif self.is_eagle() or other.is_eagle():
+            return SpeculativeAlgorithm.EAGLE
+        else:
+            return SpeculativeAlgorithm.NONE
 
     @staticmethod
     def from_string(name: str):

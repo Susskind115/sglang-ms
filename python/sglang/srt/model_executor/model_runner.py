@@ -1073,7 +1073,7 @@ class ModelRunner:
             max_total_num_tokens_ready = int((max_num_cell-100)//(
                 1+512*(self.server_args.speculative_num_steps*self.server_args.speculative_eagle_topk+self.server_args.speculative_num_draft_tokens)/self.model_config.context_len))
             if max_total_num_tokens_ready <= max_total_num_tokens_thresh:
-                max_num_reqs = int(self.max_total_num_tokens * self.model_config.context_len / 512)
+                max_num_reqs = int(max_total_num_tokens_ready / self.model_config.context_len * 512)
                 self.max_total_num_tokens = max_total_num_tokens_ready
             else:
                 max_num_reqs = 4096
@@ -1441,6 +1441,7 @@ class ModelRunner:
         elif forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         elif forward_batch.forward_mode.is_extend():
+            # logger.info(f"forward_extend, {vars(forward_batch)}")
             ret = self.forward_extend(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
