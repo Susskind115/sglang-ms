@@ -298,7 +298,6 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
-        # print("init_forward_metadata_capture_cuda_graph", bs, forward_mode, spec_info)
         if forward_mode.is_decode_or_idle():
             decode_wrappers = []
             for i in range(self.num_wrappers):
@@ -427,7 +426,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
-
+                    
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
@@ -871,6 +870,22 @@ class FlashInferIndicesUpdaterPrefill:
         use_ragged: bool,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
+        # import logging
+        # logger = logging.getLogger(__name__)
+        # logger.info(f"call_begin_forward")
+        # logger.info(f"spec_info: {spec_info}")
+        # logger.info(f"wrapper_ragged: {wrapper_ragged}")
+        # logger.info(f"wrapper_paged: {wrapper_paged}")
+        # logger.info(f"req_pool_indices: {req_pool_indices}")
+        # logger.info(f"paged_kernel_lens: {paged_kernel_lens}")
+        # logger.info(f"paged_kernel_lens_sum: {paged_kernel_lens_sum}")
+        # logger.info(f"seq_lens: {seq_lens}")
+        # logger.info(f"prefix_lens: {prefix_lens}")  
+        # logger.info(f"kv_start_idx: {kv_start_idx}")
+        # logger.info(f"kv_indptr: {kv_indptr}")
+        # logger.info(f"qo_indptr: {qo_indptr}")
+        # logger.info(f"use_ragged: {use_ragged}")
+
         bs = len(seq_lens)
         if spec_info is None:
             assert len(seq_lens) == len(req_pool_indices)
@@ -906,6 +921,11 @@ class FlashInferIndicesUpdaterPrefill:
                     self.req_to_token,
                 )
             )
+        # logger.info(f"after spec_info")
+        # logger.info(f"kv_indices: {kv_indices}")
+        # logger.info(f"kv_indptr: {kv_indptr}")
+        # logger.info(f"qo_indptr: {qo_indptr}")
+        # logger.info(f"custom_mask: {custom_mask}")
 
         # extend part
         if use_ragged:

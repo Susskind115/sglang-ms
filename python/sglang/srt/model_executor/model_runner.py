@@ -1123,9 +1123,6 @@ class ModelRunner:
         print(f"max_total_num_tokens: {self.max_total_num_tokens}, max_num_reqs: {max_num_reqs}")
         return self.max_total_num_tokens, max_num_reqs
 
-
-
-
     def init_memory_pool(
         self,
         total_gpu_memory: int,
@@ -1431,7 +1428,9 @@ class ModelRunner:
             and self.cuda_graph_runner
             and self.cuda_graph_runner.can_run(forward_batch)
         )
-        # logger.info(f"can_run_cuda_graph: {can_run_cuda_graph}， forward_batch.forward_mode: {forward_batch.forward_mode.name}")
+        if torch.distributed.get_rank() == 0:
+            logger.info(f"can_run_cuda_graph: {can_run_cuda_graph}， forward_batch.forward_mode: {forward_batch.forward_mode.name}")
+
         if can_run_cuda_graph:
             ret = self.cuda_graph_runner.replay(
                 forward_batch,

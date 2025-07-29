@@ -168,6 +168,7 @@ class ModelHub:
 
         # 动态切换相关状态
         self.mode_switch_enabled = router_args["mode_switch_enabled"]
+        self.enabled_skip_extend = router_args["enabled_skip_extend"]
         # self.mode_switch_enabled = router_args.get("mode_switch_enabled", True)
         # 默认配置
         self.effective_max_running_requests = self.running_requests_limit[0]  # 默认使用自回归的限制
@@ -198,6 +199,7 @@ class ModelHub:
             #                                            workers_ids=self.model_workers_ids, **kwargs)
         # params
         main_worker_kargs.update({"spec_flag": self.spec_flag})
+        main_worker_kargs.update({"enabled_skip_extend": self.enabled_skip_extend})
         # main_worker_kargs.update(self.router_args)
 
         # 动态切换策略：始终按最大需求分配内存
@@ -347,6 +349,12 @@ class ModelHub:
                                           draft_runner_cache_size=draft_runner_cache_size, 
                                           max_num_reqs=max_num_reqs, 
                                           )
+            # if get_rank() == 0:
+            #     logger.info(f"token_to_kv_pool_allocator: {token_to_kv_pool_allocator}")
+            # logger.info(f"worker.kvcache == token_to_kv_pool_allocator.kvcache: {worker.model_runner.token_to_kv_pool == token_to_kv_pool_allocator.get_kvcache()}")
+            # logger.info(f"worker.model_runner.token_to_kv_pool_allocator == token_to_kv_pool_allocator: {worker.model_runner.token_to_kv_pool_allocator.get_kvcache() == token_to_kv_pool_allocator.get_kvcache()}")
+            # logger.info(f"main_model_worker.model_runner.token_to_kv_pool_allocator == token_to_kv_pool_allocator: {main_model_worker.model_runner.token_to_kv_pool_allocator.get_kvcache() == token_to_kv_pool_allocator.get_kvcache()}")
+
         return workers
 
     def set_inference_mode(self, mode: str):
@@ -372,28 +380,29 @@ class ModelHub:
         self.current_mode = mode
 
         if old_mode == "speculative" and mode == "autoregressive":
-            self.spec_flag = False
-            self.speculative_num_steps = 0
-            self.speculative_eagle_topk = 0
+            # aux autoregressive
+            # self.spec_flag = False
+            self.speculative_num_steps = 1
+            self.speculative_eagle_topk = 1
             self.speculative_num_draft_tokens = 0
             for worker in self.model_workers:
-                worker.spec_flag = False
-                worker.speculative_num_steps = 0
-                worker.speculative_eagle_topk = 0
+                # worker.spec_flag = False
+                worker.speculative_num_steps = 1
+                worker.speculative_eagle_topk = 1
                 worker.speculative_num_draft_tokens = 0
-                worker.model_runner.keep_spec_info = True
+                # worker.model_runner.keep_spec_info = True
 
         elif old_mode == "autoregressive" and mode == "speculative":
-            self.spec_flag = True
+            # self.spec_flag = True
             self.speculative_num_steps = self.server_args.speculative_num_steps
             self.speculative_eagle_topk = self.server_args.speculative_eagle_topk
             self.speculative_num_draft_tokens = self.server_args.speculative_num_draft_tokens
             for worker in self.model_workers:
-                worker.spec_flag = True
-                worker.speculative_num_steps = worker.server_args.speculative_num_steps
-                worker.speculative_eagle_topk = worker.server_args.speculative_eagle_topk
-                worker.speculative_num_draft_tokens = worker.server_args.speculative_num_draft_tokens
-                worker.model_runner.keep_spec_info = False
+                # worker.spec_flag = True
+                worker.speculative_num_steps = worker.model_runner.server_args.speculative_num_steps
+                worker.speculative_eagle_topk = worker.model_runner.server_args.speculative_eagle_topk
+                worker.speculative_num_draft_tokens = worker.model_runner.server_args.speculative_num_draft_tokens
+                # worker.model_runner.keep_spec_info = False
 
         # # 动态调整有效的并发限制
         # if mode == "autoregressive":
@@ -551,23 +560,26 @@ class ModelHub:
         Returns:
             统一的返回格式: (logits_output, next_token_ids, batch_id, accepted_tokens, can_run_cuda_graph)
         """
-        # if batch.batch_size() >= 64:
+        # if batch.batch_size() >= 40:
         #     self.set_inference_mode("autoregressive")
-        #     batch.spec_flag = False
+        #     # batch.spec_flag = False
         # else:
         #     self.set_inference_mode("speculative")
-        #     batch.spec_flag = True
+            # batch.spec_flag = True
         # logger.info(f"forward_batch, current_mode: {self.current_mode}")
             
-        if self.current_mode == "speculative":
+        # if self.current_mode == "speculative":
+        if self.spec_flag:
             # print("forward_batch_speculative_generation")
             # return self.forward_batch_speculative_generation(batch)
-            return self.forward_batch_multi_speculative_generation(batch)
-        elif self.current_mode == "autoregressive":
+            # return self.forward_batch_multi_speculative_generation(batch)
+            return self.forward_batch_multi_speculative_generation_hfrouter(batch)
+        # elif self.current_mode == "autoregressive":
+        else:
             # print("forward_batch_autoregressive_generation")
             return self.forward_batch_autoregressive_generation(batch)
-        else:
-            raise ValueError(f"Invalid mode: {self.current_mode}")
+        # else:
+        #     raise ValueError(f"Invalid mode: {self.current_mode}")
     
     def forward_batch_autoregressive_generation(self, batch: ScheduleBatch) -> Tuple[LogitsProcessorOutput, List[int], int, int, bool]:
         """Run autoregressive decoding forward.
@@ -679,31 +691,13 @@ class ModelHub:
                 # retrive_next_token, retrive_next_sibling, retrive_index = spec_info.retrive_next_token.to("cpu").tolist(), spec_info.retrive_next_sibling.to("cpu").tolist(), spec_info.retrive_index.to("cpu").tolist()
                 # if get_rank() == 0:
                 #     logger.info(f"retrive_next_token: {retrive_next_token}, retrive_next_sibling: {retrive_next_sibling}")
-            # logger.info(f" forward_verify")
-            # if get_rank() == 0:
-            #     if batch.spec_info is not None and batch.spec_info.hidden_states is not None:
-            #         print(f"output draft batch.hidden_states: {batch.spec_info.hidden_states.shape}, {batch.spec_info.capture_hidden_mode.name}")
-            #     else:
-            #         print(f"outputNone draft batch.hidden_states: None, {batch.spec_info.capture_hidden_mode.name}")
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 target_worker.verify(batch, spec_info)
             )
-            # if get_rank() == 0:
-            #     if batch.spec_info is not None and batch.spec_info.hidden_states is not None:
-            #         print(f"output verify batch.hidden_states: {batch.spec_info.hidden_states.shape}, {batch.spec_info.capture_hidden_mode.name}")
-            #     else:
-            #         print(f"outputNone verify batch.hidden_states: None, {batch.spec_info.capture_hidden_mode.name}")
-            # logger.info(f"logits_output: {logits_output}, verify_output: {verify_output}, model_worker_batch: {model_worker_batch}")
-
             # If it is None, it means all requests are finished
             if batch.spec_info.verified_id is not None:
                 with draft_worker.draft_tp_context(draft_worker.model_runner.tp_group):
                     draft_worker.forward_draft_extend_after_decode(batch)
-            # if get_rank() == 0:
-            #     if batch.spec_info is not None and batch.spec_info.hidden_states is not None:
-            #         print(f"output draft_after_decode batch.hidden_states: {batch.spec_info.hidden_states.shape}, {batch.spec_info.capture_hidden_mode.name}")
-            #     else:
-            #         print(f"outputNone draft_after_decode batch.hidden_states: None, {batch.spec_info.capture_hidden_mode.name}")
             return (
                 logits_output,
                 verify_output.verified_id,
@@ -712,49 +706,96 @@ class ModelHub:
                 can_run_cuda_graph,
             )
         elif batch.forward_mode.is_idle():
-            # logger.info(f"batch_size{batch.batch_size()}, forward_idle")
             model_worker_batch = batch.get_model_worker_batch()
-            # logits_output, next_token_ids, _ = (
-            #     target_worker.forward_batch_generation(model_worker_batch)
-            # )
-
-            # return logits_output, next_token_ids, model_worker_batch.bid, 0, False
             return self.forward_batch_autoregressive_generation(batch)
         else:
-            # logger.info(f"batch_size{batch.batch_size()}, spec_info:{batch.spec_info}, forward_target_and_draft_extend prefill")
             batch.spec_info = EagleDraftInput(
                 capture_hidden_mode=self.model_router.model_capture_hidden_mode[target_worker.model_name]
             )
             logits_output, next_token_ids, bid = target_worker.forward_target_extend(batch)
-            # logger.info(f"batch_size{batch.batch_size()}, spec_info:{batch.spec_info}, forward_target_extend prefill done")
-            # for sub_worker in self.model_workers[:-1]:
-            #     batch.spec_info = EagleDraftInput(
-            #         hidden_states=logits_output.hidden_states,
-            #         verified_id=next_token_ids,
-            #         capture_hidden_mode=self.model_router.model_capture_hidden_mode[draft_worker.model_name]
-            #     )
-            #     with sub_worker.draft_tp_context(sub_worker.model_runner.tp_group):
-            #         sub_worker.forward_draft_extend(
-            #             batch, logits_output.hidden_states, next_token_ids
-            #         )
-            
-            with draft_worker.draft_tp_context(draft_worker.model_runner.tp_group):
+            logits_output_draft = logits_output
+
+            for sub_worker in self.model_workers[:-1][::-1]:
                 batch.spec_info = EagleDraftInput(
-                    hidden_states=logits_output.hidden_states,
+                    hidden_states=logits_output_draft.hidden_states,
                     verified_id=next_token_ids,
-                    capture_hidden_mode=self.model_router.model_capture_hidden_mode[draft_worker.model_name]
+                    capture_hidden_mode=self.model_router.model_capture_hidden_mode[sub_worker.model_name]
                 )
-                logits_output_draft, _, bid_draft = draft_worker.forward_draft_extend(
-                    batch
-                )
-                draft_worker.capture_for_decode(logits_output_draft, batch.spec_info)
-                # draft_worker.forward_draft_extend(
-                #     batch, logits_output.hidden_states, next_token_ids
-                # )
-                # draft_worker.capture_for_decode(logits_output_draft, batch.spec_info)
-            # logger.info(f"batch_size{batch.batch_size()}, spec_info:{batch.spec_info}, forward_draft_extend prefill done")
+                with sub_worker.draft_tp_context(sub_worker.model_runner.tp_group):
+                    logits_output_draft, _, bid_draft = sub_worker.forward_draft_extend(
+                        batch
+                    )
+            draft_worker.capture_for_decode(logits_output_draft, batch.spec_info)
             return logits_output, next_token_ids, bid, 0, False
 
+
+
+    
+    def forward_batch_multi_speculative_generation_hfrouter(
+        self, batch: ScheduleBatch
+    ) -> Tuple[LogitsProcessorOutput, List[int], int, int, bool]:
+        """Run speculative decoding forward.
+
+        NOTE: Many states of batch is modified as you go through. It is not guaranteed that
+        the final output batch have the same state as the input.
+
+        Args:
+            batch: The batch to run forward. The state of the batch is modified as it runs.
+        Returns:
+            A tuple of the final logit output of the target model, next tokens accepted,
+            the batch id (used for overlap schedule), and number of accepted tokens.
+        """
+        draft_worker, target_worker = self.model_workers[0], self.model_workers[-1]
+        mid_worker = self.model_workers[1] if len(self.model_workers) > 2 else None
+        # print("forward_speculative_generation", batch.forward_mode.name)
+        if batch.forward_mode.is_decode():
+            # logger.info(f"batch_size{batch.batch_size()}, forward_decode")
+            
+            with draft_worker.draft_tp_context(draft_worker.model_runner.tp_group):
+                spec_info = draft_worker.draft(batch)
+
+            # if torch.distributed.get_rank() == 0:
+            #     logger.info(f"draft out out_cache_loc: {batch.out_cache_loc}")
+                # retrive_next_token, retrive_next_sibling, retrive_index = spec_info.retrive_next_token.to("cpu").tolist(), spec_info.retrive_next_sibling.to("cpu").tolist(), spec_info.retrive_index.to("cpu").tolist()
+                # if get_rank() == 0:
+                #     logger.info(f"retrive_next_token: {retrive_next_token}, retrive_next_sibling: {retrive_next_sibling}")
+            logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
+                target_worker.verify(batch, spec_info)
+            )
+            # If it is None, it means all requests are finished
+            if batch.spec_info.verified_id is not None:
+                with draft_worker.draft_tp_context(draft_worker.model_runner.tp_group):
+                    draft_worker.forward_draft_extend_after_decode(batch)
+
+            return (
+                logits_output,
+                verify_output.verified_id,
+                model_worker_batch.bid,
+                sum(verify_output.accept_length_per_req_cpu),
+                can_run_cuda_graph,
+            )
+        elif batch.forward_mode.is_idle():
+            model_worker_batch = batch.get_model_worker_batch()
+            return self.forward_batch_autoregressive_generation(batch)
+        else:
+            batch.spec_info = EagleDraftInput(
+                capture_hidden_mode=self.model_router.model_capture_hidden_mode[target_worker.model_name]
+            )
+            logits_output, next_token_ids, bid = target_worker.forward_target_extend(batch)
+            logits_output_draft = logits_output
+
+            for sub_worker in self.model_workers[:-1][::-1]:
+                batch.spec_info = EagleDraftInput(
+                    hidden_states=logits_output_draft.hidden_states,
+                    verified_id=next_token_ids,
+                    capture_hidden_mode=self.model_router.model_capture_hidden_mode[sub_worker.model_name]
+                )
+                with sub_worker.draft_tp_context(sub_worker.model_runner.tp_group):
+                    logits_output_draft, _, bid_draft = sub_worker.forward_draft_extend(
+                        batch
+                    )
+            draft_worker.capture_for_decode(logits_output_draft, batch.spec_info)
+            return logits_output, next_token_ids, bid, 0, False
 
 
 

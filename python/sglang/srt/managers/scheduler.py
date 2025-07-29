@@ -390,7 +390,7 @@ class Scheduler(
             self.enable_overlap,
             self.spec_flag,
         ) = self.model_hub.get_worker_info()
-        print("max_running_requests", self.max_running_requests)
+        # print("max_running_requests", self.max_running_requests)
 
         if global_server_args_dict["max_micro_batch_size"] is None:
             # 根据当前模式设置初始的max_micro_batch_size
@@ -743,7 +743,6 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
-            
             # if batch:
             #     logger.info(f"batch, after run batch{batch.spec_info}, bs {batch.batch_size()}")
             self.last_batch = batch
@@ -1400,7 +1399,9 @@ class Scheduler(
         # if self.last_batch: 
         #     logger.info(f"self.last_batch: info:{self.last_batch.spec_info}")
         # if self.running_batch:  
-            # logger.info(f"self.running_batch: info:{self.running_batch.spec_info}")
+            # logger.info(f"self.running_batch: info:{self.running_batch.spec_info}")")
+        # if torch.distributed.get_rank() == 0 and self.last_batch is not None:
+        #     logger.info(f"get_next_batch_to_run self.running_batch: {self.running_batch.batch_size()}, last_batch: {self.last_batch.batch_size()}")
         if self.last_batch and self.last_batch.forward_mode.is_extend():
         # if self.last_batch and self.last_batch.forward_mode.is_extend() and self.spec_flag:
             if self.last_batch.chunked_req is not None:
@@ -1413,6 +1414,8 @@ class Scheduler(
             self.last_batch.filter_batch(
                 chunked_req_to_exclude=list(chunked_req_to_exclude)
             )
+            # if torch.distributed.get_rank() == 0 and self.last_batch is not None:
+            #     logger.info(f"filter_batch self.running_batch: {self.running_batch.batch_size()}, last_batch: {self.last_batch.batch_size()}")
 
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
@@ -1421,11 +1424,19 @@ class Scheduler(
             if not self.last_batch.is_empty():
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
+                    # if torch.distributed.get_rank() == 0 and self.last_batch is not None:
+                    #     logger.info(f"self.running_batch = self.last_batch self.running_batch: {self.running_batch.batch_size()}, last_batch: {self.last_batch.batch_size()}")
                 else:
                     # Merge running_batch with prefill batch
-                    self.running_batch.merge_batch(self.last_batch)
-
+                    # if torch.distributed.get_rank() == 0:
+                    #     # logger.info(f"self.running_batch: {vars(self.running_batch)}")
+                    #     logger.info(f"self.last_batch: {vars(self.last_batch)}")
+                    self.running_batch.merge_batch(self.last_batch) 
+                    # if torch.distributed.get_rank() == 0 and self.last_batch is not None:
+                    #     logger.info(f"merge_batch self.running_batch: {self.running_batch.batch_size()}, last_batch: {self.last_batch.batch_size()}")
         new_batch = self.get_new_batch_prefill()
+        # if torch.distributed.get_rank() == 0 and self.last_batch is not None:
+        #     logger.info(f"get_new_batch_prefill self.running_batch: {self.running_batch.batch_size()}, new_batch: {new_batch}, last_batch: {self.last_batch.batch_size()}")
         # logger.info(f"new_batch is not None:{new_batch is not None}, not running batch.is_empty():{not self.running_batch.is_empty()}")
         # if new_batch is not None:
         #     logger.info(f"new_batch: info:{new_batch.spec_info}")
@@ -1439,6 +1450,8 @@ class Scheduler(
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
                 ret = None
+        # if torch.distributed.get_rank() == 0 and self.last_batch is not None:
+        #     logger.info(f"update_running_batch self.running_batch: {self.running_batch.batch_size()}, last_batch: {self.last_batch.batch_size()}")
 
         # Handle DP attention
         if self.server_args.enable_dp_attention or self.server_args.enable_sp_layernorm:
@@ -1751,6 +1764,7 @@ class Scheduler(
         launch_done: Optional[threading.Event] = None,
     ):
         self.spec_flag = self.model_hub.spec_flag
+        # logger.info(f"process_batch_result self.spec_flag: {self.spec_flag}")
 
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result, launch_done)

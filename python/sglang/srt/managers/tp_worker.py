@@ -103,6 +103,7 @@ class TpModelWorker:
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
         defer_memory_init: bool = False,
+        enabled_skip_extend: bool = False,
     ):
         # Parse args
         # self.server_args = server_args
@@ -112,6 +113,7 @@ class TpModelWorker:
         self.gpu_id = gpu_id
         self.model_name = server_args.model_path
         self.spec_flag = spec_flag
+        self.enabled_skip_extend = enabled_skip_extend
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
         # Init model and tokenizer
@@ -313,7 +315,6 @@ class TpModelWorker:
                 next_token_ids = self.model_runner.sample(
                     logits_output, model_worker_batch
                 )
-
             return logits_output, next_token_ids, can_run_cuda_graph
         else:
             pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
@@ -383,6 +384,8 @@ class TpModelWorker:
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
+        self.enabled_skip_extend = self.enabled_skip_extend and self.topk == 1 and (self.speculative_num_steps+1 == self.model_runner.server_args.speculative_num_draft_tokens)
+        logger.info(f"enabled_skip_extend: {self.enabled_skip_extend}")
         # # Load hot token ids
         # if self.speculative_algorithm.is_eagle3():
         #     if server_args.speculative_token_map is not None:
@@ -534,7 +537,12 @@ class TpModelWorker:
         # Parse args
         num_seqs = batch.batch_size()
         spec_info = batch.spec_info
+        # TODO 记得修改这个变量名 skip_forward_draft_extend_after_decode_flag
+        # self.skip_forward_draft_extend_after_decode_flag = (self.topk == 1 and self.speculative_num_steps+1 == self.model_runner.server_args.speculative_num_draft_tokens)
         # print(f"spec_info draft, {spec_info}")
+        # if torch.distributed.get_rank() == 0:
+        #     # logger.info(f"req_to_token: {self.model_runner.req_to_token_pool.req_to_token}, {self.model_runner.req_to_token_pool.free_slots}, {self.model_runner.req_to_token_pool.req_to_token.shape}")
+        #     logger.info(f": {self.model_runner.req_to_token_pool}")
 
         # Accumulate penalty
         if batch.sampling_info.penalizer_orchestrator.is_required:
@@ -546,7 +554,8 @@ class TpModelWorker:
         # Allocate cache locations
         if self.page_size == 1:
             out_cache_loc, token_to_kv_pool_state_backup = batch.alloc_token_slots(
-                num_seqs * self.topk * self.speculative_num_steps, backup_state=True
+                # num_seqs * self.topk * (self.speculative_num_steps), backup_state=True
+                num_seqs * self.topk * (self.speculative_num_steps+1), backup_state=True
             )
         else:
             if self.topk == 1:
@@ -608,6 +617,8 @@ class TpModelWorker:
             self.page_size,
         )
         batch.out_cache_loc = out_cache_loc
+        # if torch.distributed.get_rank() == 0:
+        #     logger.info(f"draft start out_cache_loc: {batch.out_cache_loc}")
         batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
 
@@ -620,6 +631,10 @@ class TpModelWorker:
             model_worker_batch, self.model_runner
         )
         # print("forward_batch.spec_info", forward_batch.spec_info)
+        # # TODO 强行试一下
+        # score_list, token_list, parents_list = self.draft_cuda_graph_runner.replay(
+        #         forward_batch
+        #     )
         can_draft_cuda_graph = self.draft_cuda_graph_runner and self.draft_cuda_graph_runner.can_run(
             forward_batch
         )
@@ -636,7 +651,17 @@ class TpModelWorker:
             # Run forward steps
             score_list, token_list, parents_list = self.draft_forward(forward_batch)
 
-        self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
+        # if torch.distributed.get_rank() == 0:
+        #     logger.info(f"token_to_kv_pool_state_backup: {token_to_kv_pool_state_backup}")
+        #     logger.info(f"out_cache_loc: {out_cache_loc}")
+        
+        if self.enabled_skip_extend:
+            # 准备跳过forward_draft_extend_after_decode
+            logger.info(f"enabled_skip_extend: {self.enabled_skip_extend}")
+            pass
+        else:
+            self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
+        # self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
         ret = EagleVerifyInput.create(
             spec_info.verified_id,
@@ -648,6 +673,7 @@ class TpModelWorker:
             self.topk,
             self.speculative_num_steps,
             self.model_runner.server_args.speculative_num_draft_tokens,
+            self.enabled_skip_extend,
         )
         # print("draft ret", score_list, token_list, parents_list)
         return ret
@@ -656,6 +682,10 @@ class TpModelWorker:
         # Parse args
         spec_info = forward_batch.spec_info
         out_cache_loc = forward_batch.out_cache_loc
+
+        out_cache_loc_backup = out_cache_loc.view(forward_batch.batch_size, -1).clone()
+        out_cache_loc =  out_cache_loc_backup.clone()[:, :-1]
+
         topk_p, topk_index, hidden_states = (
             spec_info.topk_p,
             spec_info.topk_index,
@@ -687,6 +717,7 @@ class TpModelWorker:
             # Set inputs
             forward_batch.input_ids = input_ids
             out_cache_loc = out_cache_loc.view(forward_batch.batch_size, -1)
+            logger.info(f"out_cache_loc: {out_cache_loc.shape}, {forward_batch.batch_size}")
             forward_batch.out_cache_loc = out_cache_loc[
                 :, self.topk * i : self.topk * (i + 1)
             ].flatten()
@@ -705,6 +736,7 @@ class TpModelWorker:
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
+        
 
         return score_list, token_list, parents_list
     
@@ -734,6 +766,8 @@ class TpModelWorker:
             model_worker_batch, self.model_runner
         )
         forward_batch.return_logprob = False
+        
+        
         logits_output, _ = self.model_runner.forward(forward_batch)
         self._detect_nan_if_needed(logits_output)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
@@ -742,40 +776,119 @@ class TpModelWorker:
         return logits_output, None, model_worker_batch.bid
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
-        # Backup fields that will be modified in-place
-        seq_lens_backup = batch.seq_lens.clone()
-        req_pool_indices_backup = batch.req_pool_indices
-        accept_length_backup = batch.spec_info.accept_length
-        return_logprob_backup = batch.return_logprob
+        # if self.skip_forward_draft_extend_after_decode_flag:
+        if not self.enabled_skip_extend:
+            # Backup fields that will be modified in-place
+            logger.info(f"enabled_skip_extend: {self.enabled_skip_extend}")
+            seq_lens_backup = batch.seq_lens.clone()
+            req_pool_indices_backup = batch.req_pool_indices
+            accept_length_backup = batch.spec_info.accept_length
+            return_logprob_backup = batch.return_logprob
 
-        # Prepare metadata
-        batch.forward_mode = ForwardMode.DRAFT_EXTEND
-        batch.spec_info.prepare_extend_after_decode(
-            batch,
-            self.speculative_num_steps,
-        )
-        # batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        batch.spec_info.capture_hidden_mode = self.check_capture_hidden_mode(self.speculative_algorithm)
-        # batch.spec_info.capture_hidden_mode = capture_hidden_mode
-        batch.return_logprob = False
-        model_worker_batch = batch.get_model_worker_batch()
-        forward_batch = ForwardBatch.init_new(
+            # Prepare metadata
+            batch.forward_mode = ForwardMode.DRAFT_EXTEND
+            batch.spec_info.prepare_extend_after_decode(
+                batch,
+                self.speculative_num_steps,
+            )
+
+            # batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+            batch.spec_info.capture_hidden_mode = self.check_capture_hidden_mode(self.speculative_algorithm)
+            # batch.spec_info.capture_hidden_mode = capture_hidden_mode
+            batch.return_logprob = False
+            model_worker_batch = batch.get_model_worker_batch()
+
+            
+            # if batch.spec_info.accept_length.sum() == 7:
+            #     logger.info(f"batch.spec_info.accept_length: {batch.spec_info.accept_length}")
+            #     assert False
+
+            
+            # logits_output, _, _ = self.forward_batch_generation(
+            #     model_worker_batch, skip_sample=True
+            # )
+
+            # self._detect_nan_if_needed(logits_output)
+            # self.capture_for_decode(logits_output, model_worker_batch.spec_info)
+
+
+            forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.model_runner
-        )
+            )
 
-        # Run
-        logits_output, _ = self.model_runner.forward(forward_batch)
+            # Run
+            logits_output, _ = self.model_runner.forward(forward_batch)
 
-        self._detect_nan_if_needed(logits_output)
-        self.capture_for_decode(logits_output, forward_batch.spec_info)
+            self._detect_nan_if_needed(logits_output)
+            self.capture_for_decode(logits_output, forward_batch.spec_info)
 
-        # Restore backup.
-        # This is because `seq_lens` can be modified in `prepare_extend_after_decode`
-        batch.forward_mode = ForwardMode.DECODE
-        batch.seq_lens = seq_lens_backup
-        batch.req_pool_indices = req_pool_indices_backup
-        batch.spec_info.accept_length = accept_length_backup
-        batch.return_logprob = return_logprob_backup
+            # Restore backup.
+            # This is because `seq_lens` can be modified in `prepare_extend_after_decode`
+            batch.forward_mode = ForwardMode.DECODE
+            batch.seq_lens = seq_lens_backup
+            batch.req_pool_indices = req_pool_indices_backup
+            batch.spec_info.accept_length = accept_length_backup
+            batch.return_logprob = return_logprob_backup
+        else:
+            seq_lens_backup = batch.seq_lens.clone()
+            req_pool_indices_backup = batch.req_pool_indices
+            accept_length_backup = batch.spec_info.accept_length
+            return_logprob_backup = batch.return_logprob
+
+            # batch.forward_mode = ForwardMode.DRAFT_EXTEND
+            batch.forward_mode = ForwardMode.DECODE
+            # logger.info(f"before vars(batch): {vars(batch)}")
+
+            batch.spec_info.prepare_extend_one_after_decode(
+                batch,
+                self.speculative_num_steps,
+            )
+            # batch.spec_info.prepare_extend_after_decode(
+            #     batch,
+            #     self.speculative_num_steps,
+            # )
+
+            # logger.info(f"after vars(batch): {vars(batch)}")
+            # if batch.spec_info.accept_length.sum() == 7:
+            #     logger.info(f"batch.spec_info.accept_length: {batch.spec_info.accept_length}")
+            #     assert False
+
+            batch.spec_info.capture_hidden_mode = self.check_capture_hidden_mode(self.speculative_algorithm)
+            batch.return_logprob = False
+            model_worker_batch = batch.get_model_worker_batch()
+
+            # if torch.distributed.get_rank() == 0:
+            #     logger.info(f"batch: {vars(model_worker_batch)}")
+            #     if batch.batch_size() > 1:
+            #         assert False
+
+            # # Run
+            # logits_output, _ = self.model_runner.forward(forward_batch)
+
+            forward_batch = ForwardBatch.init_new(
+            model_worker_batch, self.model_runner
+            )
+
+            # Run
+            logits_output, _ = self.model_runner.forward(forward_batch)
+            # logits_output, _, _ = self.forward_batch_generation(
+            #     model_worker_batch, skip_sample=True
+            # )
+            # assert False
+
+            self._detect_nan_if_needed(logits_output)
+            # self.capture_for_decode(logits_output, forward_batch.spec_info)
+            self.capture_for_decode(logits_output, model_worker_batch.spec_info)
+
+            # logger.info(f"final vars(batch): {vars(batch)}")
+
+            
+            batch.forward_mode = ForwardMode.DECODE
+            batch.seq_lens = seq_lens_backup
+            batch.req_pool_indices = req_pool_indices_backup
+            batch.spec_info.accept_length = accept_length_backup
+            batch.return_logprob = return_logprob_backup
+
 
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
@@ -818,9 +931,18 @@ class TpModelWorker:
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         spec_info.prepare_for_verify(batch, self.page_size)
+        # if torch.distributed.get_rank() == 0:
+        #     logger.info(f"verify start out_cache_loc: {batch.out_cache_loc}")
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.spec_info = spec_info
         model_worker_batch = batch.get_model_worker_batch()
+
+        # forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        
+        # if torch.distributed.get_rank() == 0:
+            
+        #     logger.info(f"verify forward_batch.token_to_kv_pool: {forward_batch.token_to_kv_pool}")
+        #     logger.info(f"verify_model self.model_runner.token_to_kv_pool_allocator.get_kvcache(): {self.model_runner.token_to_kv_pool_allocator.get_kvcache()}")
 
         if batch.has_grammar:
             retrieve_next_token_cpu = spec_info.retrive_next_token.cpu()

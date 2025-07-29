@@ -279,6 +279,9 @@ class LogitsProcessor(nn.Module):
                     + logits_metadata.extend_seq_lens
                     - 1
                 )
+            logger.info(f"logits_metadata: {vars(logits_metadata)}")
+            logger.info(f"last_index: {last_index}")
+            logger.info(f"hidden_states: {hidden_states.shape}")
             pruned_states = hidden_states[last_index]
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]

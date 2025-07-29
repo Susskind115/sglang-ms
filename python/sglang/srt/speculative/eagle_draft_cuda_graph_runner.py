@@ -71,7 +71,8 @@ class EAGLEDraftCudaGraphRunner:
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
             self.out_cache_loc = torch.zeros(
-                (self.max_num_token * self.speculative_num_steps,), dtype=torch.int64
+                # (self.max_num_token * (self.speculative_num_steps),), dtype=torch.int64
+                (self.max_num_token * (self.speculative_num_steps+1),), dtype=torch.int64
             )
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
@@ -121,7 +122,8 @@ class EAGLEDraftCudaGraphRunner:
         # Graph inputs
         req_pool_indices = self.req_pool_indices[:num_seqs]
         seq_lens = self.seq_lens[:num_seqs]
-        out_cache_loc = self.out_cache_loc[: num_tokens * self.speculative_num_steps]
+        out_cache_loc = self.out_cache_loc[: num_tokens * (self.speculative_num_steps+1)]
+        # out_cache_loc = self.out_cache_loc[: num_tokens * (self.speculative_num_steps)]
         positions = self.positions[:num_tokens]
         topk_p = self.topk_p[:num_seqs]
         topk_index = self.topk_index[:num_seqs]
@@ -214,7 +216,8 @@ class EAGLEDraftCudaGraphRunner:
         # Common inputs
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
-        self.out_cache_loc[: raw_num_token * self.speculative_num_steps].copy_(
+        # TODO 存在问题，如果发生切换，forward_batch.out_cache_loc.shape[0] != raw_num_token * self.speculative_num_steps，则会导致问题
+        self.out_cache_loc[: raw_num_token * (self.speculative_num_steps+1)].copy_(
             forward_batch.out_cache_loc
         )
         self.positions[:raw_num_token].copy_(forward_batch.positions)

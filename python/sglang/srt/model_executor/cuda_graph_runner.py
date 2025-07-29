@@ -196,7 +196,6 @@ class CudaGraphRunner:
         self.enable_dp_attention = model_runner.server_args.enable_dp_attention
         self.enable_sp_layernorm = model_runner.server_args.enable_sp_layernorm
         self.capture_hidden_mode = model_runner.server_args.capture_hidden_mode
-        print(f"CudaGraphRunner capture_hidden_mode: {self.capture_hidden_mode.name}")
         self.spec_flag = model_runner.spec_flag
         # self.speculative_algorithm = model_runner.server_args.speculative_algorithm
         self.tp_size = model_runner.server_args.tp_size
