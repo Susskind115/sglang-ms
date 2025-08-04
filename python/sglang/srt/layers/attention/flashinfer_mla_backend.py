@@ -718,12 +718,16 @@ class FlashInferMLAMultiStepDraftBackend:
     ):
         from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
 
+        topk = model_runner.server_args.speculative_eagle_topk
         if topk > 1:
             raise ValueError(
                 f"Currently Flashinfer MLA only supports topk=1 for speculative decoding"
             )
-        self.topk = topk
-        self.speculative_num_steps = speculative_num_steps
+        # self.topk = topk
+        # self.speculative_num_steps = speculative_num_steps
+        self.set_speculative_args(model_runner.server_args.speculative_num_steps, 
+                                  model_runner.server_args.speculative_eagle_topk, 
+                                  model_runner.server_args.speculative_num_draft_tokens)
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
 
         max_bs = model_runner.req_to_token_pool.size * self.topk
@@ -754,6 +758,11 @@ class FlashInferMLAMultiStepDraftBackend:
 
         # Cached variables for generate_draft_decode_kv_indices
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
+    
+    def set_speculative_args(self, num_steps: int, topk: int, num_draft_tokens: int):
+        self.speculative_num_steps = num_steps
+        self.topk = topk
+        self.speculative_num_draft_tokens = num_draft_tokens
 
     def common_template(
         self,

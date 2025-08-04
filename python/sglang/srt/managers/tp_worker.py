@@ -188,6 +188,17 @@ class TpModelWorker:
         self.worker = self
         self.device = self.model_runner.device
 
+    def set_speculative_args(self,num_steps: int,  topk: int, num_draft_tokens: int):
+        self.speculative_num_steps = num_steps
+        self.topk = topk
+        self.speculative_num_draft_tokens = num_draft_tokens
+    
+    def update_speculative_args(self, num_steps: int, topk: int, num_draft_tokens: int):
+        self.set_speculative_args(num_steps, topk, num_draft_tokens)
+        self.padded_static_len = self.speculative_num_steps + 1
+        self.draft_model_runner.set_speculative_args(num_steps, topk, num_draft_tokens)
+        self.draft_attn_backend.set_speculative_args(num_steps, topk, num_draft_tokens)
+        self.cuda_graph_runner.set_speculative_args(num_steps, topk, num_draft_tokens)
 
     def post_init_model_runner(self, defer_memory_init: bool, 
                                visible_gpu_memory: float,
@@ -373,8 +384,9 @@ class TpModelWorker:
         # Parse arguments
         # self.server_args = server_args
         server_args = self.model_runner.server_args
-        self.topk = server_args.speculative_eagle_topk
-        self.speculative_num_steps = server_args.speculative_num_steps
+        # self.topk = server_args.speculative_eagle_topk
+        # self.speculative_num_steps = server_args.speculative_num_steps
+        self.set_speculative_args(server_args.speculative_num_steps, server_args.speculative_eagle_topk, server_args.speculative_num_draft_tokens)
         self.padded_static_len = self.speculative_num_steps + 1
         self.device = server_args.device
         # self.page_size = server_args.page_size
@@ -384,8 +396,8 @@ class TpModelWorker:
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        self.enabled_skip_extend = self.enabled_skip_extend and self.topk == 1 and (self.speculative_num_steps+1 == self.model_runner.server_args.speculative_num_draft_tokens)
-        logger.info(f"enabled_skip_extend: {self.enabled_skip_extend}")
+        self.enabled_skip_extend = self.enabled_skip_extend and self.topk == 1 and (self.speculative_num_steps+1 == self.speculative_num_draft_tokens)
+        # logger.info(f"enabled_skip_extend: {self.enabled_skip_extend}")
         # # Load hot token ids
         # if self.speculative_algorithm.is_eagle3():
         #     if server_args.speculative_token_map is not None:
@@ -554,8 +566,8 @@ class TpModelWorker:
         # Allocate cache locations
         if self.page_size == 1:
             out_cache_loc, token_to_kv_pool_state_backup = batch.alloc_token_slots(
-                # num_seqs * self.topk * (self.speculative_num_steps), backup_state=True
-                num_seqs * self.topk * (self.speculative_num_steps+1), backup_state=True
+                num_seqs * self.topk * (self.speculative_num_steps), backup_state=True
+                # num_seqs * self.topk * (self.speculative_num_steps+1), backup_state=True
             )
         else:
             if self.topk == 1:
@@ -657,11 +669,10 @@ class TpModelWorker:
         
         if self.enabled_skip_extend:
             # 准备跳过forward_draft_extend_after_decode
-            logger.info(f"enabled_skip_extend: {self.enabled_skip_extend}")
+            # logger.info(f"enabled_skip_extend: {self.enabled_skip_extend}")
             pass
         else:
             self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
-        # self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
         ret = EagleVerifyInput.create(
             spec_info.verified_id,
@@ -672,7 +683,7 @@ class TpModelWorker:
             batch.seq_lens_sum,
             self.topk,
             self.speculative_num_steps,
-            self.model_runner.server_args.speculative_num_draft_tokens,
+            self.speculative_num_draft_tokens,
             self.enabled_skip_extend,
         )
         # print("draft ret", score_list, token_list, parents_list)
@@ -682,9 +693,10 @@ class TpModelWorker:
         # Parse args
         spec_info = forward_batch.spec_info
         out_cache_loc = forward_batch.out_cache_loc
-
-        out_cache_loc_backup = out_cache_loc.view(forward_batch.batch_size, -1).clone()
-        out_cache_loc =  out_cache_loc_backup.clone()[:, :-1]
+        
+        # speculative_num_steps+1
+        # out_cache_loc_backup = out_cache_loc.view(forward_batch.batch_size, -1).clone()
+        # out_cache_loc =  out_cache_loc_backup.clone()[:, :-1]
 
         topk_p, topk_index, hidden_states = (
             spec_info.topk_p,
@@ -717,7 +729,7 @@ class TpModelWorker:
             # Set inputs
             forward_batch.input_ids = input_ids
             out_cache_loc = out_cache_loc.view(forward_batch.batch_size, -1)
-            logger.info(f"out_cache_loc: {out_cache_loc.shape}, {forward_batch.batch_size}")
+            # logger.info(f"out_cache_loc: {out_cache_loc.shape}, {forward_batch.batch_size}")
             forward_batch.out_cache_loc = out_cache_loc[
                 :, self.topk * i : self.topk * (i + 1)
             ].flatten()
@@ -779,7 +791,7 @@ class TpModelWorker:
         # if self.skip_forward_draft_extend_after_decode_flag:
         if not self.enabled_skip_extend:
             # Backup fields that will be modified in-place
-            logger.info(f"enabled_skip_extend: {self.enabled_skip_extend}")
+            # logger.info(f"enabled_skip_extend: {self.enabled_skip_extend}")
             seq_lens_backup = batch.seq_lens.clone()
             req_pool_indices_backup = batch.req_pool_indices
             accept_length_backup = batch.spec_info.accept_length
@@ -835,8 +847,8 @@ class TpModelWorker:
             accept_length_backup = batch.spec_info.accept_length
             return_logprob_backup = batch.return_logprob
 
-            # batch.forward_mode = ForwardMode.DRAFT_EXTEND
-            batch.forward_mode = ForwardMode.DECODE
+            batch.forward_mode = ForwardMode.DRAFT_EXTEND
+            # batch.forward_mode = ForwardMode.DECODE
             # logger.info(f"before vars(batch): {vars(batch)}")
 
             batch.spec_info.prepare_extend_one_after_decode(

@@ -66,6 +66,9 @@ class EAGLEWorker(TpModelWorker):
         self.server_args = server_args
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
+        # self.set_speculative_args(server_args.speculative_num_steps, 
+        #                           server_args.speculative_eagle_topk, 
+        #                           server_args.speculative_num_draft_tokens)
         self.padded_static_len = self.speculative_num_steps + 1
         self.enable_nan_detection = server_args.enable_nan_detection
         self.gpu_id = gpu_id
@@ -149,6 +152,18 @@ class EAGLEWorker(TpModelWorker):
         with self.draft_tp_context(self.draft_model_runner.tp_group):
             self.init_attention_backend()
             self.init_cuda_graphs()
+    
+    # def set_speculative_args(self, num_steps: int, topk: int, num_draft_tokens: int):
+    #     self.speculative_num_steps = num_steps
+    #     self.topk = topk
+    #     self.speculative_num_draft_tokens = num_draft_tokens
+    
+    # def update_speculative_args(self, num_steps: int, topk: int, num_draft_tokens: int):
+    #     self.set_speculative_args(num_steps, topk, num_draft_tokens)
+    #     self.padded_static_len = self.speculative_num_steps + 1
+    #     self.model_runner.set_speculative_args(num_steps, topk, num_draft_tokens)
+    #     self.draft_attn_backend.set_speculative_args(num_steps, topk, num_draft_tokens)
+    #     self.cuda_graph_runner.set_speculative_args(num_steps, topk, num_draft_tokens)
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners

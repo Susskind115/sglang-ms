@@ -419,7 +419,7 @@ class FlashInferAttnBackend(AttentionBackend):
         logits_soft_cap = layer.logit_cap
 
         q = q.contiguous()
-        if not self.forward_metadata.use_ragged:
+        if not self.forward_metadata.use_ragged:    
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
@@ -974,8 +974,11 @@ class FlashInferMultiStepDraftBackend:
     ):
         from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
 
-        self.topk = topk
-        self.speculative_num_steps = speculative_num_steps
+        # self.topk = topk
+        # self.speculative_num_steps = speculative_num_steps
+        self.set_speculative_args(model_runner.server_args.speculative_num_steps, 
+                                  model_runner.server_args.speculative_eagle_topk, 
+                                  model_runner.server_args.speculative_num_draft_tokens)
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
         self.page_size = model_runner.page_size
 
@@ -1006,6 +1009,11 @@ class FlashInferMultiStepDraftBackend:
 
         # Cached variables for generate_draft_decode_kv_indices
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
+
+    def set_speculative_args(self, num_steps: int, topk: int, num_draft_tokens: int):
+        self.speculative_num_steps = num_steps
+        self.topk = topk
+        self.speculative_num_draft_tokens = num_draft_tokens
 
     def common_template(
         self,

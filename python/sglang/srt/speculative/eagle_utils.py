@@ -90,23 +90,23 @@ class EagleDraftInput:
         accept_length_cpu = batch.spec_info.accept_length_cpu
         batch.extend_lens = [x + 1 for x in accept_length_cpu]
         batch.extend_num_tokens = sum(batch.extend_lens)
-        if torch.distributed.get_rank() == 0:
-            logger.info(f" batch.seq_lens: {batch.seq_lens}")
-            logger.info(f" batch.spec_info.seq_lens_for_draft_extend: {batch.spec_info.seq_lens_for_draft_extend}")
-            logger.info(f" batch.req_pool_indices: {batch.req_pool_indices}")
-            logger.info(f" batch.spec_info.req_pool_indices_for_draft_extend: {batch.spec_info.req_pool_indices_for_draft_extend}")
+        # if torch.distributed.get_rank() == 0:
+        #     logger.info(f" batch.seq_lens: {batch.seq_lens}")
+        #     logger.info(f" batch.spec_info.seq_lens_for_draft_extend: {batch.spec_info.seq_lens_for_draft_extend}")
+        #     logger.info(f" batch.req_pool_indices: {batch.req_pool_indices}")
+        #     logger.info(f" batch.spec_info.req_pool_indices_for_draft_extend: {batch.spec_info.req_pool_indices_for_draft_extend}")
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
         batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
         seq_lens_cpu = batch.seq_lens.tolist()
-        if torch.distributed.get_rank() == 0:
-            logger.info(f" verified_id: {self.verified_id}")
-            logger.info(f" out_cache_loc: {batch.out_cache_loc}")
-            logger.info(f" accept_length_cpu: {accept_length_cpu}")
-            logger.info(f" extend_lens: {batch.extend_lens}")
-            logger.info(f" extend_num_tokens: {batch.extend_num_tokens}")
-            logger.info(f" seq_lens: {batch.seq_lens}")
-            logger.info(f" req_pool_indices: {batch.req_pool_indices}")
-            logger.info(f" seq_lens_cpu: {seq_lens_cpu}")
+        # if torch.distributed.get_rank() == 0:
+        #     logger.info(f" verified_id: {self.verified_id}")
+        #     logger.info(f" out_cache_loc: {batch.out_cache_loc}")
+        #     logger.info(f" accept_length_cpu: {accept_length_cpu}")
+        #     logger.info(f" extend_lens: {batch.extend_lens}")
+        #     logger.info(f" extend_num_tokens: {batch.extend_num_tokens}")
+        #     logger.info(f" seq_lens: {batch.seq_lens}")
+        #     logger.info(f" req_pool_indices: {batch.req_pool_indices}")
+        #     logger.info(f" seq_lens_cpu: {seq_lens_cpu}")
 
         self.positions = torch.empty_like(self.verified_id, dtype=torch.long)
         new_verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
@@ -121,9 +121,9 @@ class EagleDraftInput:
             new_verified_id,
             next_power_of_2(speculative_num_steps + 1),
         )
-        if torch.distributed.get_rank() == 0:
-            logger.info(f" positions: {self.positions}")
-            logger.info(f" new_verified_id: {new_verified_id}")
+        # if torch.distributed.get_rank() == 0:
+        #     logger.info(f" positions: {self.positions}")
+        #     logger.info(f" new_verified_id: {new_verified_id}")
 
         batch.seq_lens_sum = sum(seq_lens_cpu)
         batch.input_ids = self.verified_id
@@ -137,113 +137,53 @@ class EagleDraftInput:
         # just for bonus token
         assert len(self.verified_id) == len(batch.out_cache_loc)
         accept_length_cpu = batch.spec_info.accept_length_cpu
-        
-        # 检查是否应该使用优化的skip_extend流程
-        enabled_skip_extend = getattr(batch, 'enabled_skip_extend', False)
-        
-        if not enabled_skip_extend:
-            # 降级到原始实现：使用传统的CUDA kernel
-            if torch.distributed.get_rank() == 0:
-                logger.info("Using fallback implementation for prepare_extend_one_after_decode")
-            
-            batch.extend_lens = [1] * self.accept_length.numel()
-            batch.extend_num_tokens = sum(batch.extend_lens)
-            batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
-            batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
-            seq_lens_cpu = batch.seq_lens.tolist()
-            
-            self.accept_length.add_(1)
-            accept_len_cum = torch.cumsum(self.accept_length, axis=0, dtype=torch.int)
-            self.positions = (batch.seq_lens - 1).to(torch.long)
-            new_verified_id = self.verified_id[accept_len_cum - 1]
-            out_cache_loc = batch.out_cache_loc[accept_len_cum - 1]
-            
-            # 使用传统的CUDA kernel生成KV索引 (不设置kv_indptr和kv_indices)
-            # 让FlashInfer backend使用默认的处理方式
-            
-            # 清空kv_indptr和kv_indices，强制使用原始分支
-            self.kv_indptr = None
-            self.kv_indices = None
-            
-            batch.seq_lens_sum = sum(seq_lens_cpu)
-            batch.input_ids = new_verified_id
-            batch.out_cache_loc = out_cache_loc
-            self.verified_id = new_verified_id
-            return
-
-        # 优化路径：使用你的融合方案
+        # batch.extend_lens = [x + 1 for x in accept_length_cpu]
+        # batch.extend_num_tokens = sum(batch.extend_lens)
         batch.extend_lens = [1] * self.accept_length.numel()
         batch.extend_num_tokens = sum(batch.extend_lens)
+        # if torch.distributed.get_rank() == 0:
+        #     logger.info(f" accept_length: {self.accept_length}")
+        #     logger.info(f" batch.extend_lens: {batch.extend_lens}")
+        #     logger.info(f" batch.extend_num_tokens: {batch.extend_num_tokens}")
+        #     logger.info(f" batch.spec_info.seq_lens_for_draft_extend: {batch.spec_info.seq_lens_for_draft_extend}")
+        #     logger.info(f" batch.spec_info.req_pool_indices: {batch.spec_info.req_pool_indices}")
+        #     logger.info(f" batch.spec_info.req_pool_indices_for_draft_extend: {batch.spec_info.req_pool_indices_for_draft_extend}")
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
         batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
         seq_lens_cpu = batch.seq_lens.tolist()
-        
-        if torch.distributed.get_rank() == 0:
-            logger.info(f" verified_id: {self.verified_id}")
-            logger.info(f" out_cache_loc: {batch.out_cache_loc}")
-            logger.info(f" accept_length_cpu: {accept_length_cpu}")
-            logger.info(f" extend_lens: {batch.extend_lens}")
-            logger.info(f" extend_num_tokens: {batch.extend_num_tokens}")
-            logger.info(f" seq_lens: {batch.seq_lens}")
-            logger.info(f" req_pool_indices: {batch.req_pool_indices}")
-            logger.info(f" seq_lens_cpu: {seq_lens_cpu}")
+        # if torch.distributed.get_rank() == 0:
+        #     logger.info(f" verified_id: {self.verified_id}")
+        #     logger.info(f" out_cache_loc: {batch.out_cache_loc}")
+        #     logger.info(f" accept_length_cpu: {accept_length_cpu}")
+        #     logger.info(f" extend_lens: {batch.extend_lens}")
+        #     logger.info(f" extend_num_tokens: {batch.extend_num_tokens}")
+        #     logger.info(f" seq_lens: {batch.seq_lens}")
+        #     logger.info(f" req_pool_indices: {batch.req_pool_indices}")
+        #     logger.info(f" seq_lens_cpu: {seq_lens_cpu}")
 
+        # self.positions = torch.empty_like(self.accept_length, dtype=torch.long)
+        # new_verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
         self.accept_length.add_(1)
+
+        # create_extend_one_spec_info[(self.accept_length.numel(),)](
+        #     self.verified_id,
+        #     batch.seq_lens,
+        #     torch.cumsum(self.accept_length, axis=0, dtype=torch.int),
+        #     self.positions,
+        #     new_verified_id,
+        # )
         accept_len_cum = torch.cumsum(self.accept_length, axis=0, dtype=torch.int)
         self.positions = (batch.seq_lens - 1).to(torch.long)
         new_verified_id = self.verified_id[accept_len_cum - 1]
         out_cache_loc = batch.out_cache_loc[accept_len_cum - 1]
 
-        # 关键修复：参考自回归推理方式生成KV索引
-        # 这是融合方案的核心 - 使用自回归风格的KV cache管理但保持spec_info框架
-        bs = len(batch.req_pool_indices)
-        
-        # 生成kv_indptr：累积每个序列的KV长度 (参考自回归推理方式)
-        self.kv_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
-        self.kv_indptr[1 : bs + 1] = torch.cumsum(batch.seq_lens, dim=0)
-        
-        # 生成kv_indices：为每个序列分配KV索引 (参考自回归推理方式)
-        paged_kernel_lens_sum = batch.seq_lens.sum().item()
-        self.kv_indices = torch.empty(paged_kernel_lens_sum, dtype=torch.int32, device="cuda")
-        
-        # 安全检查：验证索引合法性，防止内存越界
-        max_req_idx = batch.req_pool_indices.max().item()
-        max_seq_len = batch.seq_lens.max().item()
-        req_to_token_shape = batch.req_to_token_pool.req_to_token.shape
-        
-        if max_req_idx >= req_to_token_shape[0] or max_seq_len > req_to_token_shape[1]:
-            if torch.distributed.get_rank() == 0:
-                logger.error(f"Index out of bounds detected - falling back to original implementation")
-                logger.error(f"max_req_idx: {max_req_idx}, req_to_token.shape[0]: {req_to_token_shape[0]}")
-                logger.error(f"max_seq_len: {max_seq_len}, req_to_token.shape[1]: {req_to_token_shape[1]}")
-            
-            # 出现越界时，降级到原始实现
-            # 清空kv_indptr和kv_indices，强制使用原始分支
-            self.kv_indptr = None
-            self.kv_indices = None
-            
-            batch.seq_lens_sum = sum(seq_lens_cpu)
-            batch.input_ids = new_verified_id
-            batch.out_cache_loc = out_cache_loc
-            self.verified_id = new_verified_id
-            return
 
-        # 使用Triton kernel生成KV索引，就像自回归推理一样
-        create_flashinfer_kv_indices_triton[(bs,)](
-            batch.req_to_token_pool.req_to_token,  # 请求到token的映射表
-            batch.req_pool_indices,                # 当前批次的请求索引  
-            batch.seq_lens,                        # 每个序列的KV长度
-            self.kv_indptr,                        # KV指针数组
-            None,                                  # kv_start_idx (无滑动窗口)
-            self.kv_indices,                       # 输出KV索引数组
-            batch.req_to_token_pool.req_to_token.shape[1],  # 步长
-        )
 
-        if torch.distributed.get_rank() == 0:
-            logger.info(f" positions: {self.positions}")
-            logger.info(f" new_verified_id: {new_verified_id}")
-            logger.info(f" kv_indptr: {self.kv_indptr}")
-            logger.info(f" kv_indices shape: {self.kv_indices.shape}")
+        # if torch.distributed.get_rank() == 0:
+        #     # DEBUG logger.info(f" positions: {self.positions}")
+        #     logger.info(f" positions: {self.positions}")
+        #     logger.info(f" new_verified_id: {new_verified_id}")
+        # assert False
 
         batch.seq_lens_sum = sum(seq_lens_cpu)
         batch.input_ids = new_verified_id

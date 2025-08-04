@@ -610,8 +610,12 @@ class TritonMultiStepDraftBackend:
     ):
         from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
 
-        self.topk = topk
-        self.speculative_num_steps = speculative_num_steps
+
+        self.set_speculative_args(model_runner.server_args.speculative_num_steps, 
+                                  model_runner.server_args.speculative_eagle_topk, 
+                                  model_runner.server_args.speculative_num_draft_tokens)
+        # self.topk = topk
+        # self.speculative_num_steps = speculative_num_steps
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
         max_bs = model_runner.req_to_token_pool.size * self.topk
         self.kv_indptr = torch.zeros(
@@ -638,6 +642,11 @@ class TritonMultiStepDraftBackend:
         self.device = model_runner.device
         # Cached variables for generate_draft_decode_kv_indices
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
+    
+    def set_speculative_args(self, num_steps: int, topk: int, num_draft_tokens: int):
+        self.speculative_num_steps = num_steps
+        self.topk = topk
+        self.speculative_num_draft_tokens = num_draft_tokens
 
     def common_template(
         self, forward_batch: ForwardBatch, kv_indices_buffer: torch.Tensor, call_fn: int

@@ -320,11 +320,14 @@ class FlashAttentionBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
-        self.topk = model_runner.server_args.speculative_eagle_topk or 0
-        self.speculative_num_steps = speculative_num_steps
-        self.speculative_num_draft_tokens = (
-            model_runner.server_args.speculative_num_draft_tokens
-        )
+        # self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        # self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        # self.speculative_num_draft_tokens = (
+        #     model_runner.server_args.speculative_num_draft_tokens
+        # )
+        self.set_speculative_args(model_runner.server_args.speculative_num_steps, 
+                                  model_runner.server_args.speculative_eagle_topk, 
+                                  model_runner.server_args.speculative_num_draft_tokens)
         self.speculative_step_id = speculative_step_id
 
         # Local attention settings
@@ -333,6 +336,11 @@ class FlashAttentionBackend(AttentionBackend):
             if hasattr(model_runner, "attention_chunk_size")
             else None
         )
+    
+    def set_speculative_args(self, num_steps: int, topk: int, num_draft_tokens: int):
+        self.speculative_num_steps = num_steps
+        self.topk = topk or 0 # default to 0 if not set
+        self.speculative_num_draft_tokens = num_draft_tokens
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""

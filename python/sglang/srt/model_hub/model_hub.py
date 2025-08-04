@@ -160,6 +160,7 @@ class ModelHub:
         self.enable_overlap = not self.server_args.disable_overlap_schedule
 
         self.spec_flag = router_args.get("spec_flag", False)
+        
         self.speculative_num_steps = self.server_args.speculative_num_steps
         self.speculative_num_draft_tokens = self.server_args.speculative_num_draft_tokens
         self.speculative_eagle_topk = self.server_args.speculative_eagle_topk
@@ -356,6 +357,11 @@ class ModelHub:
             # logger.info(f"main_model_worker.model_runner.token_to_kv_pool_allocator == token_to_kv_pool_allocator: {main_model_worker.model_runner.token_to_kv_pool_allocator.get_kvcache() == token_to_kv_pool_allocator.get_kvcache()}")
 
         return workers
+    
+    def update_speculative_args(self, num_steps: int, topk: int, num_draft_tokens: int):
+        self.speculative_num_steps = num_steps
+        self.speculative_eagle_topk = topk
+        self.speculative_num_draft_tokens = num_draft_tokens
 
     def set_inference_mode(self, mode: str):
         """动态切换推理模式，支持'speculative'和'autoregressive'
@@ -382,27 +388,35 @@ class ModelHub:
         if old_mode == "speculative" and mode == "autoregressive":
             # aux autoregressive
             # self.spec_flag = False
-            self.speculative_num_steps = 1
-            self.speculative_eagle_topk = 1
-            self.speculative_num_draft_tokens = 0
+            self.update_speculative_args(1, 1, 2)
+            # self.speculative_num_steps = 1
+            # self.speculative_eagle_topk = 1
+            # self.speculative_num_draft_tokens = 2
             for worker in self.model_workers:
                 # worker.spec_flag = False
-                worker.speculative_num_steps = 1
-                worker.speculative_eagle_topk = 1
-                worker.speculative_num_draft_tokens = 0
+                # worker.speculative_num_steps = 1
+                # worker.speculative_eagle_topk = 1
+                # worker.speculative_num_draft_tokens = 2
                 # worker.model_runner.keep_spec_info = True
+                self.update_speculative_args(1, 1, 2)
 
         elif old_mode == "autoregressive" and mode == "speculative":
             # self.spec_flag = True
-            self.speculative_num_steps = self.server_args.speculative_num_steps
-            self.speculative_eagle_topk = self.server_args.speculative_eagle_topk
-            self.speculative_num_draft_tokens = self.server_args.speculative_num_draft_tokens
+            # self.speculative_num_steps = self.server_args.speculative_num_steps
+            # self.speculative_eagle_topk = self.server_args.speculative_eagle_topk
+            # self.speculative_num_draft_tokens = self.server_args.speculative_num_draft_tokens
+            self.update_speculative_args(self.server_args.speculative_num_steps, 
+                                            self.server_args.speculative_eagle_topk, 
+                                            self.server_args.speculative_num_draft_tokens)
             for worker in self.model_workers:
                 # worker.spec_flag = True
-                worker.speculative_num_steps = worker.model_runner.server_args.speculative_num_steps
-                worker.speculative_eagle_topk = worker.model_runner.server_args.speculative_eagle_topk
-                worker.speculative_num_draft_tokens = worker.model_runner.server_args.speculative_num_draft_tokens
+                # worker.speculative_num_steps = worker.model_runner.server_args.speculative_num_steps
+                # worker.speculative_eagle_topk = worker.model_runner.server_args.speculative_eagle_topk
+                # worker.speculative_num_draft_tokens = worker.model_runner.server_args.speculative_num_draft_tokens
                 # worker.model_runner.keep_spec_info = False
+                worker.update_speculative_args(worker.model_runner.server_args.speculative_num_steps,
+                                                worker.model_runner.server_args.speculative_eagle_topk,
+                                                worker.model_runner.server_args.speculative_num_draft_tokens)
 
         # # 动态调整有效的并发限制
         # if mode == "autoregressive":
@@ -560,13 +574,16 @@ class ModelHub:
         Returns:
             统一的返回格式: (logits_output, next_token_ids, batch_id, accepted_tokens, can_run_cuda_graph)
         """
-        # if batch.batch_size() >= 40:
-        #     self.set_inference_mode("autoregressive")
-        #     # batch.spec_flag = False
-        # else:
-        #     self.set_inference_mode("speculative")
-            # batch.spec_flag = True
-        # logger.info(f"forward_batch, current_mode: {self.current_mode}")
+        # logger.info(f"self.speculative_num_draft_tokens: {self.speculative_num_draft_tokens}")
+        # if batch.forward_mode.is_decode():
+        #     # 只有decoding阶段允许切换状态
+        #     if batch.batch_size() >= 40:
+        #         self.set_inference_mode("autoregressive")
+        #         # batch.spec_flag = False
+        #     else:
+        #         self.set_inference_mode("speculative")
+        #         # batch.spec_flag = True
+        #     # logger.info(f"forward_batch, current_mode: {self.current_mode}")
             
         # if self.current_mode == "speculative":
         if self.spec_flag:

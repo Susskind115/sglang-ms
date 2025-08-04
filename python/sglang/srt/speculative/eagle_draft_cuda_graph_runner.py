@@ -41,13 +41,18 @@ class EAGLEDraftCudaGraphRunner:
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.tp_size = self.model_runner.tp_size
         self.spec_flag = model_runner.spec_flag
-        self.topk = model_runner.server_args.speculative_eagle_topk
-        self.speculative_num_steps = model_runner.server_args.speculative_num_steps
-        server_args = model_runner.server_args
+        # self.topk = model_runner.server_args.speculative_eagle_topk
+        # self.max_speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.set_speculative_args(model_runner.server_args.speculative_num_steps, 
+                                  model_runner.server_args.speculative_eagle_topk, 
+                                  model_runner.server_args.speculative_num_draft_tokens)
+        # server_args = model_runner.server_args
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
-        self.num_tokens_per_bs = server_args.speculative_eagle_topk
+        # for init
+        # self.num_tokens_per_bs = self.topk
+        # self.max_speculative_num_steps = self.speculative_num_steps
 
         # Attention backend
         self.max_bs = max(self.capture_bs)
@@ -71,8 +76,8 @@ class EAGLEDraftCudaGraphRunner:
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
             self.out_cache_loc = torch.zeros(
-                # (self.max_num_token * (self.speculative_num_steps),), dtype=torch.int64
-                (self.max_num_token * (self.speculative_num_steps+1),), dtype=torch.int64
+                (self.max_num_token * (self.max_speculative_num_steps),), dtype=torch.int64
+                # (self.max_num_token * (self.speculative_num_steps+1),), dtype=torch.int64
             )
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
@@ -100,6 +105,13 @@ class EAGLEDraftCudaGraphRunner:
         #         "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
         #     )
         self.capture()
+    
+    def set_speculative_args(self, num_steps: int, topk: int, num_draft_tokens: int):
+        self.speculative_num_steps = num_steps
+        self.topk = topk
+        self.speculative_num_draft_tokens = num_draft_tokens
+        self.num_tokens_per_bs = self.topk
+        self.max_speculative_num_steps = self.speculative_num_steps
 
     def can_run(self, forward_batch: ForwardBatch):
         is_bs_supported = (
@@ -122,8 +134,8 @@ class EAGLEDraftCudaGraphRunner:
         # Graph inputs
         req_pool_indices = self.req_pool_indices[:num_seqs]
         seq_lens = self.seq_lens[:num_seqs]
-        out_cache_loc = self.out_cache_loc[: num_tokens * (self.speculative_num_steps+1)]
-        # out_cache_loc = self.out_cache_loc[: num_tokens * (self.speculative_num_steps)]
+        # out_cache_loc = self.out_cache_loc[: num_tokens * (self.speculative_num_steps+1)]
+        out_cache_loc = self.out_cache_loc[: num_tokens * (self.max_speculative_num_steps)]
         positions = self.positions[:num_tokens]
         topk_p = self.topk_p[:num_seqs]
         topk_index = self.topk_index[:num_seqs]
@@ -217,7 +229,9 @@ class EAGLEDraftCudaGraphRunner:
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         # TODO 存在问题，如果发生切换，forward_batch.out_cache_loc.shape[0] != raw_num_token * self.speculative_num_steps，则会导致问题
-        self.out_cache_loc[: raw_num_token * (self.speculative_num_steps+1)].copy_(
+        # self.out_cache_loc[: raw_num_token * (self.speculative_num_steps+1)].copy_(
+        speculative_num_steps = forward_batch.out_cache_loc.numel() // raw_num_token
+        self.out_cache_loc[: raw_num_token * speculative_num_steps].copy_(
             forward_batch.out_cache_loc
         )
         self.positions[:raw_num_token].copy_(forward_batch.positions)

@@ -190,6 +190,9 @@ class ModelRunner:
 
         # Model-specific adjustment
         self.model_specific_adjustment()
+        
+        # speculative args
+        self.set_speculative_args(server_args.speculative_num_steps, server_args.speculative_eagle_topk, server_args.speculative_num_draft_tokens)
 
         if server_args.show_time_cost:
             enable_show_time_cost()
@@ -250,6 +253,11 @@ class ModelRunner:
             self.pending_memory_init = {
                 "min_per_gpu_memory": min_per_gpu_memory,
             }
+
+    def set_speculative_args(self, num_steps: int, topk: int, num_draft_tokens: int):
+        self.speculative_num_steps = num_steps
+        self.topk = topk
+        self.speculative_num_draft_tokens = num_draft_tokens
             
     def init_model(self):
         server_args = self.server_args
@@ -1071,14 +1079,14 @@ class ModelRunner:
             # can be concurrently allocated, so we should give a headroom for it.
             max_total_num_tokens_thresh = 4096/512*self.model_config.context_len
             max_total_num_tokens_ready = int((max_num_cell-100)//(
-                1+512*(self.server_args.speculative_num_steps*self.server_args.speculative_eagle_topk+self.server_args.speculative_num_draft_tokens)/self.model_config.context_len))
+                1+512*(self.speculative_num_steps*self.topk+self.speculative_num_draft_tokens)/self.model_config.context_len))
             if max_total_num_tokens_ready <= max_total_num_tokens_thresh:
                 max_num_reqs = int(max_total_num_tokens_ready / self.model_config.context_len * 512)
                 self.max_total_num_tokens = max_total_num_tokens_ready
             else:
                 max_num_reqs = 4096
                 self.max_total_num_tokens = max_num_cell-100-max_num_reqs*(
-                    self.server_args.speculative_num_steps*self.server_args.speculative_eagle_topk+self.server_args.speculative_num_draft_tokens)
+                    self.speculative_num_steps*self.topk+self.speculative_num_draft_tokens)
             # self.max_total_num_tokens_target = self.max_total_num_tokens
             # self.server_args.draft_runner_cache_size = (
             #     self.max_total_num_tokens_target
@@ -1428,8 +1436,8 @@ class ModelRunner:
             and self.cuda_graph_runner
             and self.cuda_graph_runner.can_run(forward_batch)
         )
-        if torch.distributed.get_rank() == 0:
-            logger.info(f"can_run_cuda_graph: {can_run_cuda_graph}， forward_batch.forward_mode: {forward_batch.forward_mode.name}")
+        # if torch.distributed.get_rank() == 0:
+        #     logger.info(f"can_run_cuda_graph: {can_run_cuda_graph}， forward_batch.forward_mode: {forward_batch.forward_mode.name}")
 
         if can_run_cuda_graph:
             ret = self.cuda_graph_runner.replay(

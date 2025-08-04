@@ -214,9 +214,13 @@ class CudaGraphRunner:
                 raise RuntimeError("This should not happen")
             else:
                 self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-                self.num_tokens_per_bs = (
-                    self.model_runner.server_args.speculative_num_draft_tokens
-                )
+                
+                self.set_speculative_args(model_runner.server_args.speculative_num_steps, 
+                                        model_runner.server_args.speculative_eagle_topk, 
+                                        model_runner.server_args.speculative_num_draft_tokens)
+                # self.num_tokens_per_bs = (
+                #     self.model_runner.server_args.speculative_num_draft_tokens
+                # )
 
         # Attention backend
         self.max_bs = max(self.capture_bs)
@@ -305,20 +309,27 @@ class CudaGraphRunner:
                     (self.dp_size,), dtype=torch.int32
                 )
 
-        # Capture
-        try:
-            with self.model_capture_mode():
-                self.capture()
-        except RuntimeError as e:
-            raise Exception(
-                f"Capture CUDA graph failed: {e}\n"
-                "Possible solutions:\n"
-                "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
-                "2. set --cuda-graph-max-bs to a smaller value (e.g., 16)\n"
-                "3. disable torch compile by not using --enable-torch-compile\n"
-                "4. disable CUDA graph by --disable-cuda-graph. (Not recommended. Huge performance loss)\n"
-                "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
-            )
+        # # Capture
+        # try:
+        #     with self.model_capture_mode():
+        #         self.capture()
+        # except RuntimeError as e:
+        #     raise Exception(
+        #         f"Capture CUDA graph failed: {e}\n"
+        #         "Possible solutions:\n"
+        #         "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
+        #         "2. set --cuda-graph-max-bs to a smaller value (e.g., 16)\n"
+        #         "3. disable torch compile by not using --enable-torch-compile\n"
+        #         "4. disable CUDA graph by --disable-cuda-graph. (Not recommended. Huge performance loss)\n"
+        #         "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
+        #     )
+        self.capture()
+
+    def set_speculative_args(self, num_steps: int, topk: int, num_draft_tokens: int):
+        self.speculative_num_steps = num_steps
+        self.topk = topk
+        self.speculative_num_draft_tokens = num_draft_tokens
+        self.num_tokens_per_bs = num_draft_tokens
 
     @contextmanager
     def model_capture_mode(self):
@@ -447,6 +458,10 @@ class CudaGraphRunner:
             lora_paths = [next(iter(self.model_runner.server_args.lora_paths))] * bs
         else:
             lora_paths = None
+        
+        # import logging 
+        # logger = logging.getLogger(__name__)
+        # logger.info(f"out_cache_loc: {out_cache_loc.shape}, num_tokens: {num_tokens}")
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
@@ -657,8 +672,8 @@ class CudaGraphRunner:
                     retrive_next_token=None,
                     retrive_next_sibling=None,
                     retrive_cum_len=None,
-                    draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
-                    spec_steps=self.model_runner.server_args.speculative_num_steps,
+                    draft_token_num=self.speculative_num_draft_tokens,
+                    spec_steps=self.speculative_num_steps,
                     capture_hidden_mode=self.capture_hidden_mode,
                     # capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
