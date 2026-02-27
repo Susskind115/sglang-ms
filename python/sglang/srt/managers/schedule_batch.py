@@ -952,6 +952,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.tree_cache.pretty_print()
             raise RuntimeError(error_msg)
 
+        # logger.info(f"alloc_token_slots, out_cache_loc: {out_cache_loc.shape}, {self.token_to_kv_pool_allocator.available_size()}")
+        # logger.info(f"process_batch_result,{out_cache_loc.shape}, evictable_size(): {self.tree_cache.evictable_size()}")
         if backup_state:
             return out_cache_loc, state
         else:
@@ -1350,7 +1352,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # requests from the back, so we can only retract from the back.
         # TODO(sang): Clean up finish path and support better retract
         # policy.
-        if not server_args.speculative_algorithm:
+        # 使用当前批的模式判断撤退策略，避免在AR模式下误按投机留额
+        if not self.enable_spec():
             sorted_indices.sort(
                 key=lambda i: (
                     len(self.reqs[i].output_ids),
@@ -1361,13 +1364,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         def get_required_tokens(num_reqs: int):
             headroom_for_spec_decode = 0
-            if server_args.speculative_algorithm:
-                headroom_for_spec_decode += (
+            if self.enable_spec():
+                # headroom_for_spec_decode += (
+                #     num_reqs
+                #     * server_args.speculative_eagle_topk
+                #     * server_args.speculative_num_steps
+                #     + num_reqs * server_args.speculative_num_draft_tokens
+                # )
+                one_req_headroom = (
                     num_reqs
                     * server_args.speculative_eagle_topk
                     * server_args.speculative_num_steps
-                    + num_reqs * server_args.speculative_num_draft_tokens
+                    + server_args.speculative_num_draft_tokens
                 )
+                headroom_for_spec_decode += one_req_headroom
             return (
                 num_reqs * global_config.retract_decode_steps + headroom_for_spec_decode
             )
@@ -1457,6 +1467,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
         # if self.spec_algorithm.is_eagle():
+        # logger.info(f"prepare_for_decode, self.enable_spec(): {self.enable_spec()}")
         if self.enable_spec():
             # if spec decoding is used, the decode batch is prepared inside
             # `forward_batch_speculative_generation` after running draft models.
@@ -1502,10 +1513,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # A faster in-place version
             self.seq_lens.add_(1)
         self.seq_lens_sum += bs
+        # logger.info(f"prepare_for_decode, self.seq_lens: {self.seq_lens}")
 
         # Allocate memory
         if self.token_to_kv_pool_allocator.page_size == 1:
             self.out_cache_loc = self.alloc_token_slots(bs)
+            # logger.info(f"prepare_for_decode, self.out_cache_loc: {self.out_cache_loc.shape}")
         else:
             last_loc = self.req_to_token_pool.req_to_token[
                 self.req_pool_indices, self.seq_lens - 2
@@ -1572,8 +1585,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_grammar = any(req.grammar for req in self.reqs)
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
+        # if self.spec_info:
+        #     self.spec_info.filter_batch(keep_indices_device)
         if self.spec_info:
-            self.spec_info.filter_batch(keep_indices_device)
+            # Jiuzaizheli
+            if chunked_req_to_exclude is not None and len(chunked_req_to_exclude) > 0:
+                has_been_filtered = False
+            else:
+                has_been_filtered = True
+            self.spec_info.filter_batch(
+                new_indices=keep_indices_device,
+                has_been_filtered=has_been_filtered,
+            )
 
     def merge_batch(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
@@ -1610,8 +1633,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_stream |= other.has_stream
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
+        # self.spec_flag = other.spec_flag 
+        # self.spec_flag = other.spec_flag 
 
-        # logger.info(f"self.spec_info: {self.spec_info}, other.spec_info: {other.spec_info}")
         if self.spec_info:
             # logger.info(f"self, {self.batch_size()}, other, {other.batch_size()}")
             # logger.info(f"self, {vars(self)}, other, {vars(other)}")
@@ -1624,9 +1648,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_seq_lens = self.extend_lens
             extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens
-        
-
-        # logger.info(f"self.return_hidden_states get_model_worker_batch: {self.return_hidden_states}")
 
         # Create seq_lens_cpu when needed
         if (

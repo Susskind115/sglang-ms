@@ -146,6 +146,33 @@ class RotaryEmbedding(CustomOp):
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
 
+    # def forward_cuda(
+    #     self,
+    #     positions: torch.Tensor,
+    #     query: torch.Tensor,
+    #     key: torch.Tensor,
+    #     offsets: Optional[torch.Tensor] = None,
+    # ) -> Tuple[torch.Tensor, torch.Tensor]:
+    #     if _is_cuda and (self.head_size in [64, 128, 256, 512]):
+    #         apply_rope_with_cos_sin_cache_inplace(
+    #             positions=positions,
+    #             query=query,
+    #             key=key,
+    #             head_size=self.head_size,
+    #             cos_sin_cache=self.cos_sin_cache,
+    #             is_neox=self.is_neox_style,
+    #         )
+    #     else:
+    #         self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
+    #         self.vllm_rotary_embedding(
+    #             positions,
+    #             query,
+    #             key,
+    #             self.head_size,
+    #             self.cos_sin_cache,
+    #             self.is_neox_style,
+    #         )
+    #     return query, key
     def forward_cuda(
         self,
         positions: torch.Tensor,
@@ -153,6 +180,7 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+
         if _is_cuda and (self.head_size in [64, 128, 256, 512]):
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
@@ -173,6 +201,38 @@ class RotaryEmbedding(CustomOp):
                 self.is_neox_style,
             )
         return query, key
+    
+    def update_max_cos_sin_cache(self, new_cos_sin_cache_lens: int):
+        """
+        根据给定的目标长度静态更新 RoPE cache。
+        逻辑：如果目标长度超过当前缓存长度，则扩容；否则保持不变。
+        该函数应在推理循环开始前（如模型加载或初始化阶段）调用。
+        """
+        # 1. 获取当前缓存的长度
+        current_limit = self.cos_sin_cache.shape[0]
+
+        # 2. 判断是否需要扩容 ("如果短则补长，如果长于它则不用管")
+        if new_cos_sin_cache_lens > current_limit:
+            print(f"[MorphSpec Info] Pre-allocating RoPE Cache: {current_limit} -> {new_cos_sin_cache_lens}")
+            
+            # 3. 更新类内部记录的最大长度参数
+            # 这一步至关重要，因为 _compute_cos_sin_cache 通常依赖 self.max_position_embeddings
+            self.max_position_embeddings = new_cos_sin_cache_lens
+            
+            # 4. 记录当前设备和数据类型，确保新生成的 Tensor 属性一致
+            device = self.cos_sin_cache.device
+            dtype = self.cos_sin_cache.dtype
+            
+            # 5. 重新计算 Cache (调用类内部原有的计算逻辑)
+            new_cache = self._compute_cos_sin_cache()
+            
+            # 6. 确保设备和类型正确，并覆盖旧 Cache
+            self.cos_sin_cache = new_cache.to(device, dtype=dtype)
+            
+        else:
+            # 如果当前缓存已经足够大，则什么都不做
+            # print(f"[MorphSpec Info] RoPE Cache suffices: current {current_limit} >= target {new_cos_sin_cache_lens}")
+            pass
 
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
@@ -235,6 +295,7 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
         # offsets to the next cache in a tensor.
         # Each offset corresponds to the same index in scaling_factors.
         offsets: List[int] = []
+        print(f"self.scaling_factors: {self.scaling_factors}")
         for scaling_factor in self.scaling_factors:
             # NOTE(woosuk): self.max_position_embeddings is the original
             # maximum length before applying the rope scaling.

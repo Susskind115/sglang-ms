@@ -237,6 +237,9 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
+    
+    def update_max_cos_sin_cache(self, max_cos_sin_cache_lens: int):
+        self.self_attn.rotary_emb.update_max_cos_sin_cache(max_cos_sin_cache_lens)
 
 
 class Qwen2Model(nn.Module):
@@ -290,6 +293,10 @@ class Qwen2Model(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
+    
+    def update_max_cos_sin_cache(self, max_cos_sin_cache_lens: int):
+        for layer in self.layers:
+            layer.update_max_cos_sin_cache(max_cos_sin_cache_lens)
 
     def forward(
         self,
@@ -403,7 +410,10 @@ class Qwen2ForCausalLM(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
-
+    
+    def update_max_cos_sin_cache(self, max_cos_sin_cache_lens: int):
+        self.model.update_max_cos_sin_cache(max_cos_sin_cache_lens)
+            
     @torch.no_grad()
     def forward(
         self,

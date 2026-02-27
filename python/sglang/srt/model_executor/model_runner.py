@@ -258,6 +258,13 @@ class ModelRunner:
         self.speculative_num_steps = num_steps
         self.topk = topk
         self.speculative_num_draft_tokens = num_draft_tokens
+    
+    def update_speculative_args(self, num_steps: int, topk: int, num_draft_tokens: int):
+        self.set_speculative_args(num_steps, topk, num_draft_tokens)
+        if self.attn_backend is not None:
+            self.attn_backend.set_speculative_args(num_steps, topk, num_draft_tokens)
+        if self.cuda_graph_runner is not None:
+            self.cuda_graph_runner.set_speculative_args(num_steps, topk, num_draft_tokens)
             
     def init_model(self):
         server_args = self.server_args
@@ -1155,6 +1162,7 @@ class ModelRunner:
             # Draft worker shares req_to_token_pool with the target worker or model hub.
             assert self.is_draft_worker or self.req_to_token_pool.is_from_model_hub
 
+        # logger.info(f"self.use_mla_backend: {self.use_mla_backend}")
         if self.use_mla_backend:
             self.token_to_kv_pool = MLATokenToKVPool(
                 self.max_total_num_tokens,

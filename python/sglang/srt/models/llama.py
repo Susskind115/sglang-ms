@@ -266,6 +266,9 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
+    def update_max_cos_sin_cache(self, max_cos_sin_cache_lens: int):
+        self.self_attn.rotary_emb.update_max_cos_sin_cache(max_cos_sin_cache_lens)
+
 
 class LlamaModel(nn.Module):
     def __init__(
@@ -376,6 +379,10 @@ class LlamaModel(nn.Module):
                 raise RuntimeError(
                     "Self attention has no KV cache scaling " "factor attribute!"
                 )
+
+    def update_max_cos_sin_cache(self, max_cos_sin_cache_lens: int):
+        for layer in self.layers:
+            layer.update_max_cos_sin_cache(max_cos_sin_cache_lens)
 
 
 class LlamaForCausalLM(nn.Module):
@@ -704,6 +711,9 @@ class LlamaForCausalLM(nn.Module):
         self.capture_aux_hidden_states = True
         num_layers = self.config.num_hidden_layers
         self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+
+    def update_max_cos_sin_cache(self, max_cos_sin_cache_lens: int):
+        self.model.update_max_cos_sin_cache(max_cos_sin_cache_lens)
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):

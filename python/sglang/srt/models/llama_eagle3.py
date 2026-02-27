@@ -75,6 +75,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         hidden_states = self.hidden_norm(hidden_states)
 
         hidden_states = torch.cat([embeds, hidden_states], dim=-1)
+
         # Self Attention
         hidden_states = self.self_attn(
             positions=positions,

@@ -200,6 +200,8 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
+    def update_max_cos_sin_cache(self, max_cos_sin_cache_lens: int):
+        self.self_attn.rotary_emb.update_max_cos_sin_cache(max_cos_sin_cache_lens)
 
 class Qwen3Model(Qwen2Model):
     def __init__(
@@ -372,6 +374,9 @@ class Qwen3ForCausalLM(nn.Module):
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)
+    
+    def update_max_cos_sin_cache(self, max_cos_sin_cache_lens: int):
+        self.model.update_max_cos_sin_cache(max_cos_sin_cache_lens)
 
 
 EntryClass = Qwen3ForCausalLM

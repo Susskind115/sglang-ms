@@ -127,7 +127,10 @@ class TritonAttnBackend(AttentionBackend):
                 (max_bs + 1,), dtype=torch.int64, device=model_runner.device
             )
 
-        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+        # self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+        self.set_speculative_args(model_runner.server_args.speculative_num_steps,
+                                  model_runner.server_args.speculative_eagle_topk,
+                                  model_runner.server_args.speculative_num_draft_tokens)
 
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
@@ -148,6 +151,12 @@ class TritonAttnBackend(AttentionBackend):
 
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
+
+    def set_speculative_args(self, num_steps: int, topk: int, num_draft_tokens: int):
+        self.speculative_num_steps = num_steps
+        self.topk = topk or 0 # default to 0 if not set
+        self.speculative_num_draft_tokens = num_draft_tokens
+        self.num_draft_tokens = num_draft_tokens
 
     def get_num_kv_splits(
         self,
@@ -635,7 +644,8 @@ class TritonMultiStepDraftBackend:
                     kv_indptr_buf=self.kv_indptr[i],
                 )
             )
-        self.max_context_len = self.attn_backends[0].max_context_len
+        self.max_context_len = model_runner.model_config.context_len
+        # self.max_context_len = self.attn_backends[0].max_context_len
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )

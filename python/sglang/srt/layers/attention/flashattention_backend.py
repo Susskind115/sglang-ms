@@ -1942,8 +1942,11 @@ class FlashAttentionMultiStepBackend:
         self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
     ):
         self.model_runner = model_runner
-        self.topk = topk
-        self.speculative_num_steps = speculative_num_steps
+        # self.topk = topk
+        # self.speculative_num_steps = speculative_num_steps
+        self.set_speculative_args(model_runner.server_args.speculative_num_steps, 
+                                  model_runner.server_args.speculative_eagle_topk, 
+                                  model_runner.server_args.speculative_num_draft_tokens)
         self.attn_backends = []
         for i in range(self.speculative_num_steps):
             self.attn_backends.append(
@@ -1954,6 +1957,11 @@ class FlashAttentionMultiStepBackend:
                     speculative_num_steps=self.speculative_num_steps,
                 )
             )
+    
+    def set_speculative_args(self, num_steps: int, topk: int, num_draft_tokens: int):
+        self.speculative_num_steps = num_steps
+        self.topk = topk or 0 # default to 0 if not set
+        self.speculative_num_draft_tokens = num_draft_tokens
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for i in range(self.speculative_num_steps - 1):

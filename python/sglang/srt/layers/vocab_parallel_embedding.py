@@ -448,6 +448,32 @@ class VocabParallelEmbedding(torch.nn.Module):
         start_idx = self.shard_indices.org_vocab_start_index
         shard_size = self.shard_indices.org_vocab_end_index - start_idx
 
+        # # If param packed on the same dim we are sharding on, then
+        # # need to adjust offsets of loaded weight by pack_factor.
+        # if packed_dim is not None and packed_dim == output_dim:
+        #     packed_factor = (
+        #         param.packed_factor
+        #         if isinstance(param, BasevLLMParameter)
+        #         else param.packed_factor
+        #     )
+        #     assert loaded_weight.shape[output_dim] == (
+        #         self.org_vocab_size // param.packed_factor
+        #     )
+        #     start_idx = start_idx // packed_factor
+        #     shard_size = shard_size // packed_factor
+        # else:
+        #     assert loaded_weight.shape[output_dim] == (
+        #         self.org_vocab_size
+        #         // (self.tp_size if self.use_presharded_weights else 1)
+        #     ), f"{self.org_vocab_size=} {self.use_presharded_weights=} {loaded_weight.shape[output_dim]=}"
+
+        # # Copy the data.
+        # if not self.use_presharded_weights:
+        #     loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+        # param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
+        # param[loaded_weight.shape[0] :].data.fill_(0)
+
+        
         # If param packed on the same dim we are sharding on, then
         # need to adjust offsets of loaded weight by pack_factor.
         if packed_dim is not None and packed_dim == output_dim:
@@ -456,20 +482,59 @@ class VocabParallelEmbedding(torch.nn.Module):
                 if isinstance(param, BasevLLMParameter)
                 else param.packed_factor
             )
-            assert loaded_weight.shape[output_dim] == (
-                self.org_vocab_size // param.packed_factor
-            )
+            
+            # --- 修改开始 1: 针对 Packed Dim 的自动 Padding ---
+            expected_packed_size = self.org_vocab_size // param.packed_factor
+            current_packed_size = loaded_weight.shape[output_dim]
+            
+            if current_packed_size < expected_packed_size:
+                pad_len = expected_packed_size - current_packed_size
+                # 构造 padding tensor
+                pad_shape = list(loaded_weight.shape)
+                pad_shape[output_dim] = pad_len
+                pad_tensor = torch.zeros(
+                    pad_shape, dtype=loaded_weight.dtype, device=loaded_weight.device
+                )
+                loaded_weight = torch.cat([loaded_weight, pad_tensor], dim=output_dim)
+            # --- 修改结束 1 ---
+
+            # 下面这两行保留原来的逻辑
             start_idx = start_idx // packed_factor
             shard_size = shard_size // packed_factor
+            
         else:
-            assert loaded_weight.shape[output_dim] == (
-                self.org_vocab_size
-                // (self.tp_size if self.use_presharded_weights else 1)
-            ), f"{self.org_vocab_size=} {self.use_presharded_weights=} {loaded_weight.shape[output_dim]=}"
+            # --- 修改开始 2: 针对普通 Dim 的自动 Padding (您的报错主要在这里) ---
+            # 计算期望的大小
+            divisor = self.tp_size if self.use_presharded_weights else 1
+            expected_size = self.org_vocab_size // divisor
+            current_size = loaded_weight.shape[output_dim]
+
+            # 如果实际权重小于配置大小，进行自动补全
+            if current_size < expected_size:
+                print(f"[Auto-Padding] Detected mismatch: Config={expected_size}, Weight={current_size}. Padding with zeros...")
+                pad_len = expected_size - current_size
+                
+                # 构造 padding tensor
+                pad_shape = list(loaded_weight.shape)
+                pad_shape[output_dim] = pad_len
+                pad_tensor = torch.zeros(
+                    pad_shape, dtype=loaded_weight.dtype, device=loaded_weight.device
+                )
+                # 拼接到原权重后面
+                loaded_weight = torch.cat([loaded_weight, pad_tensor], dim=output_dim)
+            # --- 修改结束 2 ---
+            
+            # 原来的 Assert 被删除了，或者你可以保留一个反向检查（如果权重比配置还大则报错）
+            if loaded_weight.shape[output_dim] != expected_size:
+                 raise ValueError(f"Weight mismatch after padding! {expected_size=} {loaded_weight.shape[output_dim]=}")
 
         # Copy the data.
+        # 下面的逻辑保持不变，因为 loaded_weight 现在已经被 pad 到了正确的大小
+        # 即使 TP 切分到最后一张卡，narrow 操作也能切到刚才补的 0，不会越界
         if not self.use_presharded_weights:
             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+        
+        # 这里的 copy 逻辑非常安全
         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
         param[loaded_weight.shape[0] :].data.fill_(0)
 

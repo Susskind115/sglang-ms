@@ -615,18 +615,18 @@ class Scheduler(
                     enable_kv_cache_events=self.enable_kv_cache_events,
                 )
 
-        self.decode_mem_cache_buf_multiplier = (
-            1
-            # if self.spec_algorithm.is_none()
-            if not self.enable_spec()
-            else (
-                server_args.speculative_num_draft_tokens
-                + (
-                    server_args.speculative_eagle_topk
-                    * server_args.speculative_num_steps
-                )
-            )
-        )
+        # self.decode_mem_cache_buf_multiplier = (
+        #     1
+        #     # if self.spec_algorithm.is_none()
+        #     if not self.enable_spec()
+        #     else (
+        #         server_args.speculative_num_draft_tokens
+        #         + (
+        #             server_args.speculative_eagle_topk
+        #             * server_args.speculative_num_steps
+        #         )
+        #     )
+        # )
 
     def init_metrics(self):
         self.last_gen_throughput: float = 0.0
@@ -737,11 +737,13 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
+                # memory_leak_num = self.online_check_memory()
+                # logger.info(f"memory leak: {memory_leak_num}")
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states
-                self.check_memory()
+                # self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
             # if batch:
             #     logger.info(f"batch, after run batch{batch.spec_info}, bs {batch.batch_size()}")
@@ -1337,6 +1339,20 @@ class Scheduler(
             self.stats.spec_accept_length = spec_accept_length
             self.metrics_collector.log_stats(self.stats)
         self._publish_kv_events()
+    
+    def online_check_memory(self):
+        available_size = (
+            self.token_to_kv_pool_allocator.available_size()
+            + self.tree_cache.evictable_size()
+        )
+        protected_size = self.tree_cache.protected_size()
+        max_total_num_tokens = (
+            self.max_total_num_tokens
+            if not self.enable_hierarchical_cache
+            else self.max_total_num_tokens - protected_size
+        )
+        memory_leak_num = max_total_num_tokens - available_size
+        return memory_leak_num
 
     def check_memory(self):
         available_size = (
@@ -1443,13 +1459,16 @@ class Scheduler(
         if new_batch is not None:
             # Run prefill first if possible
             ret = new_batch
+            # logger.info(f"prefill, self.running_batch.spec_flag: {new_batch.spec_flag}, self.running_batch.forward_mode.is_decode(): {new_batch.forward_mode.is_decode()}")
         else:
             # Run decode
             if not self.running_batch.is_empty():
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
+                # logger.info(f"decode, self.running_batch.spec_flag: {self.running_batch.spec_flag}, self.running_batch.forward_mode.is_decode(): {self.running_batch.forward_mode.is_decode()}")
             else:
                 ret = None
+            # logger.info(f"decode, self.running_batch.spec_flag: {self.running_batch.spec_flag}, self.running_batch.forward_mode.is_decode(): {self.running_batch.forward_mode}")
         # if torch.distributed.get_rank() == 0 and self.last_batch is not None:
         #     logger.info(f"update_running_batch self.running_batch: {self.running_batch.batch_size()}, last_batch: {self.last_batch.batch_size()}")
 
@@ -1594,7 +1613,8 @@ class Scheduler(
             self.model_config,
             self.enable_overlap,
             # self.spec_algorithm,
-            self.spec_flag,
+            # self.spec_flag,
+            self.model_hub.current_spec_flag,
             self.server_args.enable_custom_logit_processor,
             chunked_req=self.chunked_req,
         )
@@ -1629,8 +1649,10 @@ class Scheduler(
             batch.batch_is_full = False
             return batch
 
+        self.model_hub.check_switch_mode(batch)
+
         # Check if decode out of memory
-        if not batch.check_decode_mem(self.decode_mem_cache_buf_multiplier) or (
+        if not batch.check_decode_mem(self.model_hub.decode_mem_cache_buf_multiplier) or (
             TEST_RETRACT and batch.batch_size() > 10
         ):
             old_ratio = self.new_token_ratio
@@ -1681,7 +1703,6 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             # if self.spec_algorithm.is_none():
-            # print("self.enable_spec()", self.enable_spec())
             if not self.enable_spec():
                 # (
                 #     logits_output,
@@ -1714,6 +1735,7 @@ class Scheduler(
                     num_accepted_tokens,
                     can_run_cuda_graph,
                 ) = self.model_hub.forward_batch(batch)
+                # ) = self.model_hub.forward_batch_multi_speculative_generation_hfrouter(batch)
                 # ) = self.draft_worker.forward_batch_speculative_generation(batch)
                 self.spec_num_total_accepted_tokens += (
                     num_accepted_tokens + batch.batch_size()
@@ -1783,6 +1805,8 @@ class Scheduler(
             # However, one minor issue is that this code path does not check the status of detokenizer manager.
             self.return_health_check_ct -= 1
             self.send_to_tokenizer.send_pyobj(HealthCheckOutput())
+        # logger.info(f"process_batch_result, available_size(): {self.token_to_kv_pool_allocator.available_size()}")
+        # logger.info(f"process_batch_result, evictable_size(): {self.tree_cache.evictable_size()}")
 
 
     def prepare_dp_attn_batch(self, local_batch: ScheduleBatch):
@@ -1796,6 +1820,7 @@ class Scheduler(
             disable_cuda_graph=self.server_args.disable_cuda_graph,
             spec_flag=self.spec_flag,
             # spec_algorithm=self.spec_algorithm,
+            # TODO self.model_hub.speculative_num_draft_tokens
             speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
         )
 
@@ -2096,35 +2121,35 @@ class Scheduler(
             server_args=global_server_args_dict,
         )
 
-    def switch_inference_mode(self, mode: str):
-        """动态切换推理模式
+    # def switch_inference_mode(self, mode: str):
+    #     """动态切换推理模式
 
-        Args:
-            mode: 推理模式 ('speculative' 或 'autoregressive')
+    #     Args:
+    #         mode: 推理模式 ('speculative' 或 'autoregressive')
 
-        Returns:
-            bool: 切换是否成功
-        """
-        if not hasattr(self.model_hub, 'mode_switch_enabled') or not self.model_hub.mode_switch_enabled:
-            logger.warning("Dynamic mode switching is not enabled")
-            return False
+    #     Returns:
+    #         bool: 切换是否成功
+    #     """
+    #     if not hasattr(self.model_hub, 'mode_switch_enabled') or not self.model_hub.mode_switch_enabled:
+    #         logger.warning("Dynamic mode switching is not enabled")
+    #         return False
 
-        # 等待当前批次完成
-        if self.cur_batch is not None and not self.cur_batch.is_empty():
-            logger.info("Waiting for current batch to complete before switching mode...")
-            # 这里可以添加等待逻辑，或者标记为待切换状态
+    #     # 等待当前批次完成
+    #     if self.cur_batch is not None and not self.cur_batch.is_empty():
+    #         logger.info("Waiting for current batch to complete before switching mode...")
+    #         # 这里可以添加等待逻辑，或者标记为待切换状态
 
-        # 调用ModelHub的切换方法
-        success = self.model_hub.set_inference_mode(mode, scheduler_ref=self)
+    #     # 调用ModelHub的切换方法
+    #     success = self.model_hub.set_inference_mode(mode, scheduler_ref=self)
 
-        if success:
-            logger.info(f"Successfully switched to {mode} mode")
-            # 清理缓存以确保状态一致性
-            self.flush_cache()
-        else:
-            logger.error(f"Failed to switch to {mode} mode")
+    #     if success:
+    #         logger.info(f"Successfully switched to {mode} mode")
+    #         # 清理缓存以确保状态一致性
+    #         self.flush_cache()
+    #     else:
+    #         logger.error(f"Failed to switch to {mode} mode")
 
-        return success
+    #     return success
 
     def handle_rpc_request(self, recv_req: RpcReqInput):
         # Handle RPC requests
@@ -2500,7 +2525,7 @@ def run_scheduler_process(
             elif scheduler.enable_overlap:
                 scheduler.event_loop_overlap()
             else:
-                # print("event_loop_normal, here")
+                # logger.info(f"event_loop_normal")
                 scheduler.event_loop_normal()
         elif disaggregation_mode == DisaggregationMode.PREFILL:
             if scheduler.enable_overlap:

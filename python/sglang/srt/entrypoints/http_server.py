@@ -235,57 +235,57 @@ async def set_internal_state(obj: SetInternalStateReq, request: Request):
     return res
 
 
-@app.api_route("/switch_inference_mode", methods=["POST", "PUT"])
-async def switch_inference_mode(request: Request):
-    """动态切换推理模式API
+# @app.api_route("/switch_inference_mode", methods=["POST", "PUT"])
+# async def switch_inference_mode(request: Request):
+#     """动态切换推理模式API
 
-    Body:
-        {
-            "mode": "speculative" | "autoregressive"
-        }
-    """
-    try:
-        body = await request.json()
-        mode = body.get("mode")
+#     Body:
+#         {
+#             "mode": "speculative" | "autoregressive"
+#         }
+#     """
+#     try:
+#         body = await request.json()
+#         mode = body.get("mode")
 
-        if mode not in ["speculative", "autoregressive"]:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "Invalid mode. Must be 'speculative' or 'autoregressive'"}
-            )
+#         if mode not in ["speculative", "autoregressive"]:
+#             return JSONResponse(
+#                 status_code=400,
+#                 content={"error": "Invalid mode. Must be 'speculative' or 'autoregressive'"}
+#             )
 
-        # 通过RPC调用调度器的切换方法
-        from sglang.srt.managers.io_struct import RpcReqInput
-        rpc_req = RpcReqInput(
-            method="switch_inference_mode",
-            parameters=mode
-        )
+#         # 通过RPC调用调度器的切换方法
+#         from sglang.srt.managers.io_struct import RpcReqInput
+#         rpc_req = RpcReqInput(
+#             method="switch_inference_mode",
+#             parameters=mode
+#         )
 
-        result = await _global_state.tokenizer_manager.handle_rpc_request(rpc_req)
+#         result = await _global_state.tokenizer_manager.handle_rpc_request(rpc_req)
 
-        if result.success:
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "success": True,
-                    "message": f"Successfully switched to {mode} mode",
-                    "current_mode": mode
-                }
-            )
-        else:
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "success": False,
-                    "message": f"Failed to switch to {mode} mode: {result.message}",
-                }
-            )
+#         if result.success:
+#             return JSONResponse(
+#                 status_code=200,
+#                 content={
+#                     "success": True,
+#                     "message": f"Successfully switched to {mode} mode",
+#                     "current_mode": mode
+#                 }
+#             )
+#         else:
+#             return JSONResponse(
+#                 status_code=500,
+#                 content={
+#                     "success": False,
+#                     "message": f"Failed to switch to {mode} mode: {result.message}",
+#                 }
+#             )
 
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": f"Internal server error: {str(e)}"}
-        )
+#     except Exception as e:
+#         return JSONResponse(
+#             status_code=500,
+#             content={"error": f"Internal server error: {str(e)}"}
+#         )
 
 
 # fastapi implicitly converts json in the request to obj (dataclass)
@@ -905,6 +905,7 @@ def _wait_and_warmup(
 
     try:
         if server_args.disaggregation_mode == "null":
+            logger.info(f"Start of prefill warmup null ...")
             res = requests.post(
                 url + request_name,
                 json=json_data,

@@ -3,6 +3,7 @@
 from typing import List
 
 import torch
+import logging
 
 from sglang.srt.utils import is_cuda, is_hip
 
@@ -11,6 +12,7 @@ if is_cuda() or is_hip():
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
 
+logger = logging.getLogger(__name__)
 
 def build_tree_kernel_efficient_preprocess(
     verified_id: torch.Tensor,
@@ -89,6 +91,7 @@ def build_tree_kernel_efficient(
     # then, positions = [7, 8, 8, 9]
     positions = torch.empty((bs * num_verify_tokens,), device=device, dtype=torch.long)
 
+    # sgl_build_tree_kernel_efficient_python(
     sgl_build_tree_kernel_efficient(
         parent_list,
         top_scores_index,
@@ -111,6 +114,68 @@ def build_tree_kernel_efficient(
         draft_tokens,
     )
 
+
+
+def sgl_build_tree_kernel_efficient_python(
+    parent_list: torch.Tensor, selected_index: torch.Tensor, verified_seq_len: torch.Tensor, tree_mask: torch.Tensor,
+    positions: torch.Tensor, retrive_index: torch.Tensor, retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor, topk: int, depth: int, draft_token_num: int
+):
+    bs = parent_list.size(0)
+    seq_len_cumsum = torch.cat([torch.tensor([0], device=verified_seq_len.device), torch.cumsum(verified_seq_len, dim=0)])
+    for bid in range(bs):
+        seq_len = verified_seq_len[bid].item()
+        seq_tree_offset = (seq_len_cumsum[bid] * draft_token_num + draft_token_num * draft_token_num * bid)
+        for tid in range(draft_token_num):
+            token_tree_row_start_idx = seq_tree_offset + (seq_len + draft_token_num) * tid
+            draft_tokens_mask_start_idx = token_tree_row_start_idx + seq_len
+            for i in range(draft_token_num - 1):
+                 tree_mask[draft_tokens_mask_start_idx + 1 + i] = False
+            if tid == 0:
+                positions[bid * draft_token_num + 0] = seq_len
+                retrive_index_offset = bid * draft_token_num
+                retrive_index[bid, 0] = retrive_index_offset
+                for i in range(draft_token_num - 1, 0, -1):
+                    current_token_global_idx = retrive_index_offset + i
+                    retrive_index[bid, i] = current_token_global_idx
+                    parent_tb_idx = selected_index[bid, i - 1] // topk
+                    parent_position_in_draft_list = 0
+                    if parent_tb_idx > 0:
+                        parent_token_original_idx = parent_list[bid, parent_tb_idx]
+                        found = False
+                        for p_pos in range(draft_token_num - 1):
+                            if selected_index[bid, p_pos] == parent_token_original_idx:
+                                parent_position_in_draft_list = p_pos + 1
+                                found = True
+                                break
+                        if not found:
+                           print(f"WARNING: Invalid eagle tree!!! Detected a token with no parent token selected for bid={bid}, token_i={i}")
+                           continue
+                    origin_next_token = retrive_next_token[bid, parent_position_in_draft_list].item()
+                    retrive_next_token[bid, parent_position_in_draft_list] = i
+                    if origin_next_token != -1:
+                        retrive_next_sibling[bid, i] = origin_next_token
+            else:
+                position_depth = 0
+                current_token_in_selected_list_idx = tid - 1
+                while True:
+                    position_depth += 1
+                    parent_in_draft_list_idx = current_token_in_selected_list_idx
+                    mask_idx_to_set = draft_tokens_mask_start_idx + parent_in_draft_list_idx
+                    tree_mask[mask_idx_to_set] = True
+                    parent_tb_idx = selected_index[bid, current_token_in_selected_list_idx] // topk
+                    if parent_tb_idx == 0:
+                        break
+                    parent_token_original_idx = parent_list[bid, parent_tb_idx]
+                    found = False
+                    for p_pos in range(draft_token_num - 1):
+                        if selected_index[bid, p_pos] == parent_token_original_idx:
+                            current_token_in_selected_list_idx = p_pos
+                            found = True
+                            break
+                    if not found:
+                        break
+                positions[bid * draft_token_num + tid] = position_depth + seq_len
 
 def test_build_tree_kernel_efficient():
     verified_id = torch.tensor([29974, 13], device="cuda", dtype=torch.int32)

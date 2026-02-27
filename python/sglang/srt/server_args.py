@@ -430,14 +430,15 @@ class ServerArgs:
                     "speculative_eagle_topk is adjusted to 1 when page_size > 1"
                 )
 
-            if (
-                self.speculative_eagle_topk == 1
-                and self.speculative_num_draft_tokens != self.speculative_num_steps + 1
-            ):
-                logger.warning(
-                    "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 when speculative_eagle_topk == 1"
-                )
-                self.speculative_num_draft_tokens = self.speculative_num_steps + 1
+            #  strict control of speculative_num_draft_tokens
+            # if (
+            #     self.speculative_eagle_topk == 1
+            #     and self.speculative_num_draft_tokens != self.speculative_num_steps + 1
+            # ):
+            #     logger.warning(
+            #         "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 when speculative_eagle_topk == 1"
+            #     )
+            #     self.speculative_num_draft_tokens = self.speculative_num_steps + 1
 
             # The token generated from the verify step is counted.
             # If sepculative_num_steps >= speculative_num_draft_tokens, the additional tokens will definitely be discarded.

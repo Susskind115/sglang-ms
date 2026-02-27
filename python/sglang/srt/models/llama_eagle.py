@@ -13,6 +13,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import logging
+logger = logging.getLogger(__name__)
+
 from sglang.srt.utils import add_prefix
 
 # Adapted from
@@ -108,6 +111,10 @@ class LlamaModel(nn.Module):
                 residual,
             )
         return hidden_states + residual
+    
+    def update_max_cos_sin_cache(self, max_cos_sin_cache_lens: int):
+        for layer in self.layers:
+            layer.update_max_cos_sin_cache(max_cos_sin_cache_lens)
 
 
 class LlamaForCausalLMEagle(LlamaForCausalLM):

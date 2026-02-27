@@ -206,6 +206,19 @@ class TokenToKVPoolAllocator:
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
         return select_index
+    
+    def precise_alloc(self, used_indices: torch.Tensor):
+        if used_indices.numel() == 0:
+            return None
+        check_mask = torch.isin(used_indices, self.free_slots)
+        if not check_mask.all():
+            invalid_indices = used_indices[~check_mask]
+            raise RuntimeError(
+                f"Precise alloc failed: detected double allocation or invalid indices. "
+                f"Indices {invalid_indices.tolist()} are not in the free slots list."
+            )
+        alloc_mask = ~torch.isin(self.free_slots, used_indices)
+        self.free_slots = self.free_slots[alloc_mask]
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
@@ -226,7 +239,7 @@ class TokenToKVPoolAllocator:
             self.free(torch.cat(self.free_group))
 
     def backup_state(self):
-        return self.free_slots
+        return self.free_slots.clone()
 
     def restore_state(self, free_slots):
         self.free_slots = free_slots

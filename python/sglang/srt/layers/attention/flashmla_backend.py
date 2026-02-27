@@ -82,7 +82,16 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.q_data_type = model_runner.dtype
         self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
 
-        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+        # self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+        self.set_speculative_args(model_runner.server_args.speculative_num_steps, 
+                                  model_runner.server_args.speculative_eagle_topk, 
+                                  model_runner.server_args.speculative_num_draft_tokens)
+    
+    def set_speculative_args(self, num_steps: int, topk: int, num_draft_tokens: int):
+        self.speculative_num_steps = num_steps
+        self.topk = topk or 0 # default to 0 if not set
+        self.speculative_num_draft_tokens = num_draft_tokens
+        self.num_draft_tokens = num_draft_tokens
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
 
@@ -470,8 +479,11 @@ class FlashMLAMultiStepDraftBackend:
             raise ValueError(
                 f"Currently FlashMLA only supports topk=1 for speculative decoding"
             )
-        self.topk = topk
-        self.speculative_num_steps = speculative_num_steps
+        # self.topk = topk
+        # self.speculative_num_steps = speculative_num_steps
+        self.set_speculative_args(model_runner.server_args.speculative_num_steps, 
+                                  model_runner.server_args.speculative_eagle_topk, 
+                                  model_runner.server_args.speculative_num_draft_tokens)
         max_bs = model_runner.req_to_token_pool.size * self.topk
         self.kv_indptr = torch.zeros(
             (
@@ -492,6 +504,11 @@ class FlashMLAMultiStepDraftBackend:
                     kv_last_page_len_buf=None,
                 )
             )
+    
+    def set_speculative_args(self, num_steps: int, topk: int, num_draft_tokens: int):
+        self.speculative_num_steps = num_steps
+        self.topk = topk or 0 # default to 0 if not set
+        self.speculative_num_draft_tokens = num_draft_tokens
 
     def common_template(
         self,

@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 class LogitsProcessorOutput:
     ## Part 1: This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logits of the next tokens.       shape: [#seq, vocab_size]
-    next_token_logits: torch.Tensor
+    next_token_logits: Optional[torch.Tensor] = None
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
@@ -87,6 +87,8 @@ class LogitsProcessorOutput:
     # The logprobs and ids of the requested token ids in input positions. shape: [#seq, n] (n is the number of requested token ids)
     input_token_ids_logprobs_val: Optional[List] = None
     input_token_ids_logprobs_idx: Optional[List] = None
+
+    all_token_logits: Optional[torch.Tensor] = None
 
 
 @dataclasses.dataclass
