@@ -37,7 +37,7 @@ import hashlib
 import logging
 import threading
 from enum import Enum, auto
-from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -57,6 +57,10 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
 from sglang.srt.metrics.collector import TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_hub.utils.specrouter_debug import (
+    describe_spec_info,
+    specrouter_debug_log,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -877,6 +881,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # Runtime-only telemetry for the latest target-side generation step.
+    runtime_step_telemetry: Optional[Dict[str, Union[str, int, float]]] = None
+
     @classmethod
     def init_new(
         cls,
@@ -1536,6 +1543,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
+        original_req_count = len(self.reqs)
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
@@ -1588,14 +1596,37 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # if self.spec_info:
         #     self.spec_info.filter_batch(keep_indices_device)
         if self.spec_info:
-            # Jiuzaizheli
-            if chunked_req_to_exclude is not None and len(chunked_req_to_exclude) > 0:
-                has_been_filtered = False
-            else:
-                has_been_filtered = True
+            topk_p = getattr(self.spec_info, "topk_p", None)
+            topk_p_len = topk_p.shape[0] if topk_p is not None else None
+            # Only treat spec_info as pre-filtered when its per-request decode tensors
+            # already match the filtered batch size.
+            has_been_filtered = (
+                (chunked_req_to_exclude is None or len(chunked_req_to_exclude) == 0)
+                and topk_p_len is not None
+                and topk_p_len == len(self.reqs)
+            )
+            specrouter_debug_log(
+                logger,
+                "schedule_batch_filter_before_spec_info",
+                original_req_count=original_req_count,
+                keep_len=len(keep_indices),
+                filtered_req_count=len(self.reqs),
+                has_been_filtered=has_been_filtered,
+                topk_p_len=topk_p_len,
+                spec_info=describe_spec_info(self.spec_info),
+            )
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
                 has_been_filtered=has_been_filtered,
+            )
+            specrouter_debug_log(
+                logger,
+                "schedule_batch_filter_after_spec_info",
+                original_req_count=original_req_count,
+                keep_len=len(keep_indices),
+                filtered_req_count=len(self.reqs),
+                has_been_filtered=has_been_filtered,
+                spec_info=describe_spec_info(self.spec_info),
             )
 
     def merge_batch(self, other: "ScheduleBatch"):
@@ -1637,9 +1668,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # self.spec_flag = other.spec_flag 
 
         if self.spec_info:
+            specrouter_debug_log(
+                logger,
+                "schedule_batch_merge_before",
+                self_req_count=len(self.reqs),
+                other_req_count=len(other.reqs),
+                self_spec_info=describe_spec_info(self.spec_info),
+                other_spec_info=describe_spec_info(other.spec_info),
+            )
             # logger.info(f"self, {self.batch_size()}, other, {other.batch_size()}")
             # logger.info(f"self, {vars(self)}, other, {vars(other)}")
             self.spec_info.merge_batch(other.spec_info)
+            specrouter_debug_log(
+                logger,
+                "schedule_batch_merge_after",
+                merged_req_count=len(self.reqs),
+                merged_spec_info=describe_spec_info(self.spec_info),
+            )
 
     def get_model_worker_batch(self) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():

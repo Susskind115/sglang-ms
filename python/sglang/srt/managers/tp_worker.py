@@ -1102,6 +1102,8 @@ class TpModelWorker:
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.spec_info = spec_info
         model_worker_batch = batch.get_model_worker_batch()
+        target_req_bs = int(model_worker_batch.req_pool_indices.numel())
+        target_token_bs = int(model_worker_batch.input_ids.shape[0])
 
         # forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         
@@ -1167,6 +1169,18 @@ class TpModelWorker:
         # Prepare the batch for the next draft forwards.
         batch.forward_mode = ForwardMode.DECODE
         batch.spec_info = res.draft_input
+        emitted_tokens = int(sum(res.accept_length_per_req_cpu) + target_req_bs)
+        batch.runtime_step_telemetry = {
+            "target_step_kind": "target_verify",
+            "target_step_req_bs": target_req_bs,
+            "target_step_token_bs": target_token_bs,
+            "accepted_tokens_per_target_step": emitted_tokens,
+            "verify_tokens_per_emitted_token": (
+                float(target_token_bs) / float(emitted_tokens)
+                if emitted_tokens > 0
+                else 0.0
+            ),
+        }
         # batch.spec_info.verified_id = res.verified_id
         # logger.info(f"after verify, draft_input: {res.draft_input.accept_length}")
 

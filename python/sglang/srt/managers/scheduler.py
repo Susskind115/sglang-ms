@@ -27,6 +27,7 @@ from http import HTTPStatus
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import psutil
 import setproctitle
 import torch
@@ -159,6 +160,174 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 from sglang.srt.model_hub.model_hub import ModelHub
 
 logger = logging.getLogger(__name__)
+
+TRUE_BATCH_THRESHOLDS = (32, 64, 128, 256)
+TRUE_BATCH_WINDOW_SIZE = int(os.environ.get("SGLANG_TRUE_BATCH_WINDOW_SIZE", 1024))
+
+
+class StepMetricTracker:
+    def __init__(
+        self,
+        thresholds: Tuple[int, ...] = TRUE_BATCH_THRESHOLDS,
+        window_size: int = TRUE_BATCH_WINDOW_SIZE,
+    ) -> None:
+        self.thresholds = thresholds
+        self.window = deque(maxlen=window_size)
+        self.cumulative_count = 0
+        self.cumulative_sum = 0.0
+        self.cumulative_max = 0.0
+        self.cumulative_ge_counts = {threshold: 0 for threshold in thresholds}
+
+    def add(self, value: Union[int, float]) -> None:
+        value = float(value)
+        self.window.append(value)
+        self.cumulative_count += 1
+        self.cumulative_sum += value
+        self.cumulative_max = max(self.cumulative_max, value)
+        for threshold in self.thresholds:
+            if value >= threshold:
+                self.cumulative_ge_counts[threshold] += 1
+
+    def snapshot(self) -> Dict[str, Dict[str, Union[int, float]]]:
+        rolling_count = len(self.window)
+        if rolling_count == 0:
+            rolling: Dict[str, Union[int, float]] = {
+                "count": 0,
+                "avg": 0.0,
+                "p50": 0.0,
+                "p90": 0.0,
+                "max": 0.0,
+            }
+        else:
+            values = np.asarray(self.window, dtype=np.float64)
+            rolling = {
+                "count": int(values.size),
+                "avg": float(values.mean()),
+                "p50": float(np.percentile(values, 50)),
+                "p90": float(np.percentile(values, 90)),
+                "max": float(values.max()),
+            }
+        for threshold in self.thresholds:
+            key = f"fraction_ge_{threshold}"
+            if rolling_count == 0:
+                rolling[key] = 0.0
+            else:
+                hits = sum(1 for value in self.window if value >= threshold)
+                rolling[key] = float(hits) / float(rolling_count)
+
+        cumulative: Dict[str, Union[int, float]] = {
+            "count": self.cumulative_count,
+            "avg": (
+                float(self.cumulative_sum / self.cumulative_count)
+                if self.cumulative_count > 0
+                else 0.0
+            ),
+            "max": (
+                float(self.cumulative_max) if self.cumulative_count > 0 else 0.0
+            ),
+        }
+        for threshold in self.thresholds:
+            key = f"fraction_ge_{threshold}"
+            if self.cumulative_count == 0:
+                cumulative[key] = 0.0
+            else:
+                cumulative[key] = float(
+                    self.cumulative_ge_counts[threshold]
+                ) / float(self.cumulative_count)
+
+        return {
+            "rolling": rolling,
+            "cumulative": cumulative,
+        }
+
+
+class TrueBatchTelemetryTracker:
+    def __init__(self) -> None:
+        self.thresholds = TRUE_BATCH_THRESHOLDS
+        self.window_size = TRUE_BATCH_WINDOW_SIZE
+        self.metrics = {
+            "target_step_req_bs": StepMetricTracker(
+                self.thresholds, self.window_size
+            ),
+            "target_step_token_bs": StepMetricTracker(
+                self.thresholds, self.window_size
+            ),
+            "target_autoregressive_req_bs": StepMetricTracker(
+                self.thresholds, self.window_size
+            ),
+            "target_autoregressive_token_bs": StepMetricTracker(
+                self.thresholds, self.window_size
+            ),
+            "target_verify_req_bs": StepMetricTracker(
+                self.thresholds, self.window_size
+            ),
+            "target_verify_token_bs": StepMetricTracker(
+                self.thresholds, self.window_size
+            ),
+            "accepted_tokens_per_target_step": StepMetricTracker(
+                self.thresholds, self.window_size
+            ),
+            "verify_tokens_per_emitted_token": StepMetricTracker(
+                (2, 4, 8, 16), self.window_size
+            ),
+        }
+        self.target_step_kind_counts = defaultdict(int)
+        self.last_sample: Optional[Dict[str, Union[str, int, float]]] = None
+
+    def record(self, telemetry: Optional[Dict[str, Union[str, int, float]]]) -> None:
+        if not telemetry:
+            return
+
+        kind = str(telemetry.get("target_step_kind", "unknown"))
+        req_bs = telemetry.get("target_step_req_bs")
+        token_bs = telemetry.get("target_step_token_bs")
+        emitted_tokens = telemetry.get("accepted_tokens_per_target_step")
+        verify_cost = telemetry.get("verify_tokens_per_emitted_token")
+
+        if req_bs is None or token_bs is None:
+            return
+
+        req_bs = int(req_bs)
+        token_bs = int(token_bs)
+        self.metrics["target_step_req_bs"].add(req_bs)
+        self.metrics["target_step_token_bs"].add(token_bs)
+        self.target_step_kind_counts[kind] += 1
+
+        if kind == "target_autoregressive":
+            self.metrics["target_autoregressive_req_bs"].add(req_bs)
+            self.metrics["target_autoregressive_token_bs"].add(token_bs)
+        elif kind == "target_verify":
+            self.metrics["target_verify_req_bs"].add(req_bs)
+            self.metrics["target_verify_token_bs"].add(token_bs)
+
+        if emitted_tokens is not None:
+            self.metrics["accepted_tokens_per_target_step"].add(int(emitted_tokens))
+        if verify_cost is not None:
+            self.metrics["verify_tokens_per_emitted_token"].add(float(verify_cost))
+
+        self.last_sample = {
+            "target_step_kind": kind,
+            "target_step_req_bs": req_bs,
+            "target_step_token_bs": token_bs,
+            "accepted_tokens_per_target_step": (
+                int(emitted_tokens) if emitted_tokens is not None else 0
+            ),
+            "verify_tokens_per_emitted_token": (
+                float(verify_cost) if verify_cost is not None else 0.0
+            ),
+        }
+
+    def snapshot(self) -> Dict[str, object]:
+        return {
+            "window_size_steps": self.window_size,
+            "thresholds": list(self.thresholds),
+            "target_step_kind_counts": dict(self.target_step_kind_counts),
+            "last_sample": self.last_sample,
+            **{
+                metric_name: tracker.snapshot()
+                for metric_name, tracker in self.metrics.items()
+            },
+        }
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
@@ -636,6 +805,7 @@ class Scheduler(
         self.spec_num_total_forward_ct = 0
         self.cum_spec_accept_length = 0
         self.cum_spec_accept_count = 0
+        self.true_batch_tracker = TrueBatchTelemetryTracker()
         self.stats = SchedulerStats()
         if self.enable_metrics:
             engine_type = "unified"
@@ -1656,8 +1826,16 @@ class Scheduler(
             TEST_RETRACT and batch.batch_size() > 10
         ):
             old_ratio = self.new_token_ratio
+            decode_server_args = self.server_args
+            if (
+                self.tp_worker is not None
+                and getattr(self.tp_worker, "model_runner", None) is not None
+            ):
+                decode_server_args = self.tp_worker.model_runner.server_args
 
-            retracted_reqs, new_token_ratio = batch.retract_decode(self.server_args)
+            retracted_reqs, new_token_ratio = batch.retract_decode(
+                decode_server_args
+            )
             self.new_token_ratio = new_token_ratio
 
             logger.info(
@@ -1687,6 +1865,7 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
+        batch.runtime_step_telemetry = None
         # logger.info(f"self.is_generation:{self.is_generation}, self.enable_spec():{self.enable_spec()}")
 
         # Check profiler
@@ -1716,6 +1895,18 @@ class Scheduler(
                 #     pp_hidden_states_proxy_tensors = logits_output
 
                 model_worker_batch = batch.get_model_worker_batch()
+                if batch.forward_mode.is_decode_or_idle():
+                    req_bs = int(model_worker_batch.req_pool_indices.numel())
+                    token_bs = int(model_worker_batch.input_ids.shape[0])
+                    batch.runtime_step_telemetry = {
+                        "target_step_kind": "target_autoregressive",
+                        "target_step_req_bs": req_bs,
+                        "target_step_token_bs": token_bs,
+                        "accepted_tokens_per_target_step": req_bs,
+                        "verify_tokens_per_emitted_token": (
+                            float(token_bs) / float(req_bs) if req_bs > 0 else 0.0
+                        ),
+                    }
                 
                 if self.pp_group.is_last_rank:
                     logits_output, next_token_ids, can_run_cuda_graph = (
@@ -1742,6 +1933,8 @@ class Scheduler(
                 )
                 self.spec_num_total_forward_ct += batch.batch_size()
                 self.num_generated_tokens += num_accepted_tokens
+
+            self.true_batch_tracker.record(batch.runtime_step_telemetry)
 
             if self.pp_group.is_last_rank:
                 batch.output_ids = next_token_ids
@@ -2078,6 +2271,7 @@ class Scheduler(
             )
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
+        ret["true_batch_stats"] = self.true_batch_tracker.snapshot()
         return GetInternalStateReqOutput(
             internal_state=ret,
         )
@@ -2113,6 +2307,7 @@ class Scheduler(
                 )
                 logger.info(f"{avg_spec_accept_length=}")
             self.cum_spec_accept_length = self.cum_spec_accept_count = 0
+            self.true_batch_tracker = TrueBatchTelemetryTracker()
             for k, v in server_args_dict.items():
                 global_server_args_dict[k] = v
             logger.info(f"Global server args updated! " f"{global_server_args_dict=}")

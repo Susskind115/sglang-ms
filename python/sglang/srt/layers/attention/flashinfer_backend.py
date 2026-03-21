@@ -29,6 +29,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import is_flashinfer_available, next_power_of_2
 
+import logging
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -665,8 +668,10 @@ class FlashInferIndicesUpdaterDecode:
         kv_indptr: torch.Tensor,
         kv_start_idx: torch.Tensor,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-    ):
+    ):  
+        # if spec_info is None:
         if spec_info is None:
+            logger.info("hereh in None")
             bs = len(req_pool_indices)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
@@ -689,8 +694,9 @@ class FlashInferIndicesUpdaterDecode:
                 self.req_to_token.shape[1],
             )
         else:
+            logger.info("hereh in spec_info")
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
-            bs = kv_indptr.shape[0] - 1
+            bs = kv_indptr.shape[0] - 1 
 
         wrapper.begin_forward(
             kv_indptr,
@@ -1007,7 +1013,7 @@ class FlashInferMultiStepDraftBackend:
             self.attn_backends.append(
                 FlashInferAttnBackend(
                     model_runner,
-                    skip_prefill=True,
+                    # skip_prefill=True,
                     kv_indptr_buf=self.kv_indptr[i],
                     kv_last_page_len_buf=self.kv_last_page_len,
                 )

@@ -57,6 +57,13 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 # from sglang_lib.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import empty_context, fast_topk, get_available_gpu_memory, is_cuda
 from sglang.srt.model_hub.utils.nvtx_marker import nvtx_profile, count_time
+from sglang.srt.model_hub.utils.specrouter_debug import (
+    describe_batch,
+    describe_chain_diff,
+    describe_spec_info,
+    describe_strategy,
+    specrouter_debug_log,
+)
 
 from .chain_profiler import ChainPerformanceProfiler
 from .chain_scheduler import ChainScheduler
@@ -851,6 +858,14 @@ class ModelHub:
 
         req_indices = batch.req_pool_indices
         req_indices = req_indices.to(self.req_probs_latest.device, dtype=torch.long)
+        if req_indices.numel() == 0:
+            self.current_batch_probs = None
+            return None
+        if torch.any(req_indices < 0) or torch.any(
+            req_indices >= self.req_probs_latest.shape[0]
+        ):
+            self.current_batch_probs = None
+            return None
         # probs = self.req_probs_latest.index_select(0, req_indices)
         # value = probs.mean(dim=0)
         probs_value = self.req_probs_latest.index_select(0, req_indices).mean(dim=0)
@@ -875,6 +890,15 @@ class ModelHub:
         target_model_name: str,
         draft_model_name: str,
     ) -> None:
+        if (
+            self.chain_scheduler is None
+            or probs_of_draft is None
+            or probs_count is None
+            or self.req_probs_latest is None
+            or self.req_probs_count is None
+            or self.req_probs_active is None
+        ):
+            return
         
         device = self.req_probs_latest.device
         dtype = self.req_probs_latest.dtype
@@ -960,6 +984,16 @@ class ModelHub:
         probs_count: Optional[Union[torch.Tensor, int]],
         # draft_model_name: str,
     ) -> None:
+        if (
+            self.chain_scheduler is None
+            or similarity_matrix is None
+            or probs_count is None
+            or self.req_probs_latest is None
+            or self.req_probs_count is None
+            or self.req_probs_active is None
+        ):
+            return
+
         device = self.req_probs_latest.device
         probs_tensor = similarity_matrix.detach().to(
             device, dtype=self.req_probs_latest.dtype
@@ -1288,6 +1322,9 @@ class ModelHub:
     def check_switch_mode(self, batch: ScheduleBatch):
         # if get_rank() == 0:
         #     logger.info(f"check_switch_mode, ")
+        if self.chain_scheduler is None:
+            self.current_batch_probs = None
+            return
 
         self._attach_batch_probs(batch)
         # global_similarity_matrix = self.chain_scheduler.global_similarity_matrix
@@ -1313,6 +1350,16 @@ class ModelHub:
                     objects_to_sync = [cascade_list, selected_chain, dp_details]
         dist.broadcast_object_list(objects_to_sync, src=0)
         cascade_list, selected_chain, dp_details = objects_to_sync
+        specrouter_debug_log(
+            logger,
+            "check_switch_mode_result",
+            min_accept_length=min_accept_length,
+            selected_chain=selected_chain,
+            process_lazy_switch=self.process_lazy_switch,
+            current_strategy=describe_strategy(self.current_chain_strategy),
+            lazy_strategy=describe_strategy(self.lazy_switch_strategy),
+            batch=describe_batch(batch),
+        )
         # logger.info(f"cascade_list: {cascade_list}")
         # logger.info(f"cur: {self._current_chain_ids()} ")
         if selected_chain is not None:
@@ -1417,6 +1464,15 @@ class ModelHub:
         #     self.set_inference_mode("autoregressive", batch)
 
     def lazy_switch(self, new_strategy: ChainStrategy, diff: ChainStrategyDiff):
+        specrouter_debug_log(
+            logger,
+            "lazy_switch_enter",
+            process_lazy_switch=self.process_lazy_switch,
+            current_strategy=describe_strategy(self.current_chain_strategy),
+            lazy_strategy=describe_strategy(self.lazy_switch_strategy),
+            new_strategy=describe_strategy(new_strategy),
+            diff=describe_chain_diff(diff),
+        )
         if self.process_lazy_switch:
             self.current_chain_strategy = self.lazy_switch_strategy
             self.lazy_switch_strategy = None
@@ -1427,6 +1483,14 @@ class ModelHub:
             self.lazy_switch_strategy = new_strategy
             self.lazy_switch_diff = diff
             self.process_lazy_switch = True
+        specrouter_debug_log(
+            logger,
+            "lazy_switch_exit",
+            process_lazy_switch=self.process_lazy_switch,
+            current_strategy=describe_strategy(self.current_chain_strategy),
+            lazy_strategy=describe_strategy(self.lazy_switch_strategy),
+            diff=describe_chain_diff(self.lazy_switch_diff),
+        )
         
     def update_spec_config_from_dp(self, dp_details: List[Dict]):
         max_num_steps, max_eagle_topk, max_num_draft_tokens = 0, 0, 0
@@ -1508,6 +1572,7 @@ class ModelHub:
         Returns:
             统一的返回格式: (logits_output, next_token_ids, batch_id, accepted_tokens, can_run_cuda_graph)
         """
+        batch.runtime_step_telemetry = None
         # if self.current_mode == "speculative":
         #     return self.forward_batch_multi_speculative_generation_hfrouter(batch)
         # # elif self.current_mode == "autoregressive":
@@ -1527,6 +1592,17 @@ class ModelHub:
         # target_worker = self.target_worker
         target_worker = self.model_workers[-1]
         model_worker_batch = batch.get_model_worker_batch()
+        req_bs = int(model_worker_batch.req_pool_indices.numel())
+        token_bs = int(model_worker_batch.input_ids.shape[0])
+        batch.runtime_step_telemetry = {
+            "target_step_kind": "target_autoregressive",
+            "target_step_req_bs": req_bs,
+            "target_step_token_bs": token_bs,
+            "accepted_tokens_per_target_step": req_bs,
+            "verify_tokens_per_emitted_token": (
+                float(token_bs) / float(req_bs) if req_bs > 0 else 0.0
+            ),
+        }
         
         # 执行自回归推理
         logits_output, next_token_ids, can_run_cuda_graph = (
@@ -1550,6 +1626,18 @@ class ModelHub:
         # logger.info(f"adaptive_spec_forward, next_state: {next_state}, last_worker_name: {last_worker_name}, exec_worker_name: {exec_worker_name}")
         if get_rank() == 0:
             logger.info(f"current {next_state}")
+        specrouter_debug_log(
+            logger,
+            "adaptive_spec_forward_enter",
+            next_state=next_state,
+            exec_worker_name=exec_worker_name,
+            last_worker_name=last_worker_name,
+            sync_model_name_list=sync_model_name_list,
+            submit_flag=self.submit_flag,
+            process_lazy_switch=self.process_lazy_switch,
+            current_chain_ids=self._current_chain_ids(),
+            batch=describe_batch(batch),
+        )
         bs = float(batch.batch_size())
         # if exec_worker_name == self.model_router.target_model_name and next_state in ["verify", "autoregressive"]:
         #     logger.info(f"adaptive_spec_forward, {next_state}, batch.seq_lens: {batch.seq_lens}, batch.req_pool_indices: {batch.req_pool_indices}")
@@ -1565,6 +1653,12 @@ class ModelHub:
             # return verify_input_spec_info
             # logger.info(f"adaptive_spec_forward, draft, verify_input_spec_info: {vars(verify_input_spec_info)}")
             self.verify_input_spec_info = verify_input_spec_info
+            specrouter_debug_log(
+                logger,
+                "draft_state_ready_for_verify",
+                exec_worker_name=exec_worker_name,
+                verify_input_spec_info=describe_spec_info(self.verify_input_spec_info),
+            )
 
         elif next_state == "verify":
             # self._maybe_save_states(exec_worker_name, last_worker_name)
@@ -1623,6 +1717,22 @@ class ModelHub:
             # self.check_submit(verify_output, exec_worker_name)
             next_token_ids = verify_output.verified_id
             num_accepted_tokens = sum(verify_output.accept_length_per_req_cpu)
+            specrouter_debug_log(
+                logger,
+                "verify_state_complete",
+                exec_worker_name=exec_worker_name,
+                last_worker_name=last_worker_name,
+                submit_flag=self.submit_flag,
+                accepted_indices_len=len(verify_output.accepted_indices),
+                finished_req_pool_indices_len=len(verify_output.finished_req_pool_indices),
+                accept_length_per_req_cpu=verify_output.accept_length_per_req_cpu,
+                verify_output_accept_length=(
+                    verify_output.accept_length.tolist()
+                    if verify_output.accept_length is not None
+                    else None
+                ),
+                batch=describe_batch(batch),
+            )
 
             if self.first_prefill_pass == False:
                 if target_worker.model_name == self.model_router.target_model_name and len(verify_output.finished_req_pool_indices) > 0:
@@ -1684,6 +1794,14 @@ class ModelHub:
                                 "draft_extend", 1, bs, # forward_count, verify_K
                                 draft_worker, draft_worker.forward_draft_extend_after_decode, batch, reload_model_history
                             )
+                    specrouter_debug_log(
+                        logger,
+                        "draft_extend_state_complete",
+                        exec_worker_name=exec_worker_name,
+                        draft_worker_name=draft_worker.model_name,
+                        sync_model_name_list=sync_model_name_list,
+                        batch=describe_batch(batch),
+                    )
         
         elif next_state == "autoregressive":
             target_worker = self.worker_map[exec_worker_name]
@@ -1715,6 +1833,7 @@ class ModelHub:
             #     logits_output.hidden_states = None
             # else:
             model_worker_batch = batch.get_model_worker_batch()
+            logger.info("hereh in")
             logits_output, next_token_ids, can_run_cuda_graph = (
                 # autoregressive
                 self._profile_call(
@@ -1726,9 +1845,11 @@ class ModelHub:
                     model_worker_batch,
                 )
             )
+            logger.info("hereh out")
             # # logger.info(f"batch.spec_info: {batch.spec_info}")
             if batch.spec_info is not None:
             #     # logger.info(f"rebuild_spec_info")
+                logger.info("jkkakdkaksdkfa")
                 # draft model come back
                 self.rebuild_spec_info(batch, logits_output, next_token_ids)
                 # if hidden_states_pool is not None:
@@ -1916,6 +2037,16 @@ class ModelHub:
             self.verify_input_spec_info.enabled_skip_extend = False # no sumbit, no skip extend
             self.verify_input_spec_info.is_top_verify = is_top_verify
         self.verify_input_spec_info.capture_hidden_mode = self.model_router.get_model_capture_hidden_mode_from_table(exec_worker_name, "full")
+        specrouter_debug_log(
+            logger,
+            "maybe_load_state_ready",
+            exec_worker_name=exec_worker_name,
+            last_worker_name=last_worker_name,
+            num_verify_tokens=num_verify_tokens,
+            submit_flag=self.submit_flag,
+            verify_input_spec_info=describe_spec_info(self.verify_input_spec_info),
+            batch=describe_batch(batch),
+        )
 
 
     @nvtx_profile
@@ -1935,6 +2066,16 @@ class ModelHub:
             # logger.info(f"submit_flag: {submit_flag}, last_worker_name{last_worker_name}")
             self.submit_flag = submit_flag
             self.state_manager.update_reqs(batch, keep_req_pool_indices, keep_reqs_index)
+            specrouter_debug_log(
+                logger,
+                "maybe_save_state_intermediate",
+                exec_worker_name=exec_worker_name,
+                last_worker_name=last_worker_name,
+                submit_flag=self.submit_flag,
+                keep_req_pool_indices_len=len(keep_req_pool_indices),
+                keep_reqs_index_len=len(keep_reqs_index),
+                batch=describe_batch(batch),
+            )
 
             # if self.state_manager.out_loc_cache_for_token is not None:
                 # dst_out_cache_loc = self.state_manager.out_loc_cache_for_token[:self.state_manager.out_loc_cache_num.item()].flatten()
@@ -1963,6 +2104,14 @@ class ModelHub:
                 # batch.spec_info.enabled_skip_extend = False
                 if overflow_mask.any():
                     batch.spec_info.enabled_skip_extend = False
+            specrouter_debug_log(
+                logger,
+                "maybe_save_state_target",
+                exec_worker_name=exec_worker_name,
+                last_worker_name=last_worker_name,
+                submit_flag=self.submit_flag,
+                batch=describe_batch(batch),
+            )
     
     def rebuild_spec_info(self, batch: ScheduleBatch, logits_output: LogitsProcessorOutput, next_token_ids: torch.Tensor):
         device = batch.seq_lens.device
@@ -1996,6 +2145,11 @@ class ModelHub:
             batch.spec_info.hidden_states = logits_output.hidden_states
         batch.spec_info.accept_length_cpu = batch.spec_info.accept_length_for_draft_extend.tolist()
         batch.spec_info.next_out_cache_loc = batch.alloc_token_slots(len(batch.spec_info.verified_id))
+        specrouter_debug_log(
+            logger,
+            "rebuild_spec_info_complete",
+            batch=describe_batch(batch),
+        )
 
     def forward_batch_multi_speculative_generation_hfrouter(
         self, batch: ScheduleBatch

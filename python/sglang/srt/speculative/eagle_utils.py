@@ -23,6 +23,10 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.build_eagle_tree import build_tree_kernel_efficient
 from sglang.srt.utils import fast_topk, is_cuda, is_hip, next_power_of_2
+from sglang.srt.model_hub.utils.specrouter_debug import (
+    describe_spec_info,
+    specrouter_debug_log,
+)
 from sglang.srt.model_hub.utils.tensor_process import shift_right_fixed, shift_left_ragged
 
 if is_cuda():
@@ -43,7 +47,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-SIMULATE_ACC_LEN = os.environ.get("SIMULATE_ACC_LEN")
+# SIMULATE_ACC_LEN = os.environ.get("SIMULATE_ACC_LEN")
 
 
 @dataclass
@@ -535,10 +539,33 @@ class EagleDraftInput:
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool):
         if self.topk_p is None:
             return
+        specrouter_debug_log(
+            logger,
+            "draft_input_filter_before",
+            has_been_filtered=has_been_filtered,
+            new_indices_len=len(new_indices),
+            spec_info=describe_spec_info(self),
+        )
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
             # therefore, we don't need to filter the batch again in scheduler
             if len(new_indices) != len(self.topk_p):
+                specrouter_debug_log(
+                    logger,
+                    "draft_input_filter_mismatch",
+                    has_been_filtered=has_been_filtered,
+                    new_indices_len=len(new_indices),
+                    topk_p_len=len(self.topk_p),
+                    verified_id_len=(
+                        len(self.verified_id) if self.verified_id is not None else None
+                    ),
+                    next_out_cache_loc_len=(
+                        len(self.next_out_cache_loc)
+                        if self.next_out_cache_loc is not None
+                        else None
+                    ),
+                    spec_info=describe_spec_info(self),
+                )
                 logger.warning(
                     f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, this should not happen"
                 )
@@ -550,16 +577,60 @@ class EagleDraftInput:
             self.next_out_cache_loc = self.next_out_cache_loc[: len(new_indices)]
             self.filtered_out_cache_loc = self.next_out_cache_loc[len(new_indices):]
         else:
-            # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
+            # In some paths the scheduler is the first component that removes
+            # finished requests, so all per-request fields must be indexed here.
+            original_next_out_cache_loc = self.next_out_cache_loc
             self.topk_p = self.topk_p[new_indices]
             self.topk_index = self.topk_index[new_indices]
-            if self.capture_hidden_mode.need_capture():
+            if self.capture_hidden_mode.need_capture() and self.hidden_states is not None:
                 self.hidden_states = self.hidden_states[new_indices]
-            self.verified_id = self.verified_id[new_indices]
-            self.next_out_cache_loc = self.next_out_cache_loc[new_indices]
-            mask = torch.zeros(self.next_out_cache_loc.shape[0], dtype=torch.bool, device=self.next_out_cache_loc.device)
-            mask[new_indices] = True
-            self.filtered_out_cache_loc = self.next_out_cache_loc[~mask]
+            if self.verified_id is not None:
+                self.verified_id = self.verified_id[new_indices]
+            if self.drafted_id is not None:
+                self.drafted_id = self.drafted_id[new_indices]
+            if self.accept_length is not None:
+                self.accept_length = self.accept_length[new_indices]
+            accept_length_for_draft_extend = getattr(
+                self, "accept_length_for_draft_extend", None
+            )
+            if accept_length_for_draft_extend is not None:
+                self.accept_length_for_draft_extend = (
+                    accept_length_for_draft_extend[new_indices]
+                )
+            seq_lens_for_draft_extend = getattr(
+                self, "seq_lens_for_draft_extend", None
+            )
+            if seq_lens_for_draft_extend is not None:
+                self.seq_lens_for_draft_extend = (
+                    seq_lens_for_draft_extend[new_indices]
+                )
+            req_pool_indices_for_draft_extend = getattr(
+                self, "req_pool_indices_for_draft_extend", None
+            )
+            if req_pool_indices_for_draft_extend is not None:
+                self.req_pool_indices_for_draft_extend = (
+                    req_pool_indices_for_draft_extend[new_indices]
+                )
+            accept_length_cpu = getattr(self, "accept_length_cpu", None)
+            if accept_length_cpu is not None:
+                keep_indices = new_indices.tolist()
+                self.accept_length_cpu = [accept_length_cpu[i] for i in keep_indices]
+            if original_next_out_cache_loc is not None:
+                keep_mask = torch.zeros(
+                    original_next_out_cache_loc.shape[0],
+                    dtype=torch.bool,
+                    device=original_next_out_cache_loc.device,
+                )
+                keep_mask[new_indices] = True
+                self.next_out_cache_loc = original_next_out_cache_loc[new_indices]
+                self.filtered_out_cache_loc = original_next_out_cache_loc[~keep_mask]
+        specrouter_debug_log(
+            logger,
+            "draft_input_filter_after",
+            has_been_filtered=has_been_filtered,
+            new_indices_len=len(new_indices),
+            spec_info=describe_spec_info(self),
+        )
 
     def merge_batch(self, spec_info: EagleDraftInput):
         # if self.hidden_states is None:
@@ -579,6 +650,12 @@ class EagleDraftInput:
 
         if spec_info is None:
             return 
+        specrouter_debug_log(
+            logger,
+            "draft_input_merge_before",
+            self_spec_info=describe_spec_info(self),
+            other_spec_info=describe_spec_info(spec_info),
+        )
 
         if spec_info.next_out_cache_loc is not None and self.next_out_cache_loc is not None:
             self.next_out_cache_loc = torch.cat(
@@ -600,6 +677,11 @@ class EagleDraftInput:
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        specrouter_debug_log(
+            logger,
+            "draft_input_merge_after",
+            merged_spec_info=describe_spec_info(self),
+        )
 
 
 @dataclass
@@ -969,16 +1051,16 @@ class EagleVerifyInput:
             # logger.info(f"target_probs: {target_probs.max(dim=2)[0]}, probs_of_draft_mid :{probs_of_draft_mid}")
             # probs_of_draft = probs_of_draft_mid.mean(dim=1)
 
-        if SIMULATE_ACC_LEN:
-            # Do simulation
-            accept_index = _generate_simulated_accept_index(
-                accept_index=accept_index,
-                predict=predict,  # mutable
-                accept_length=accept_length,  # mutable
-                simulate_acc_len=SIMULATE_ACC_LEN,
-                bs=bs,
-                spec_steps=self.spec_steps,
-            )
+        # if SIMULATE_ACC_LEN:
+        #     # Do simulation
+        #     accept_index = _generate_simulated_accept_index(
+        #         accept_index=accept_index,
+        #         predict=predict,  # mutable
+        #         accept_length=accept_length,  # mutable
+        #         simulate_acc_len=SIMULATE_ACC_LEN,
+        #         bs=bs,
+        #         spec_steps=self.spec_steps,
+        #     )
 
         new_accept_index = []
         unfinished_index = []
@@ -1538,35 +1620,35 @@ def select_top_k_tokens(
         )
 
 
-def _generate_simulated_accept_index(
-    accept_index,
-    predict,
-    accept_length,
-    simulate_acc_len,
-    bs,
-    spec_steps,
-):
-    simulate_acc_len_float = float(simulate_acc_len)
-    simulated_values = torch.normal(
-        mean=simulate_acc_len_float,
-        std=1.0,
-        size=(1,),
-        device="cpu",
-    )
-    # clamp simulated values to be between 1 and self.spec_steps
-    simulated_values = torch.clamp(simulated_values, min=1.0, max=spec_steps)
-    simulate_acc_len = int(simulated_values.round().item())
+# def _generate_simulated_accept_index(
+#     accept_index,
+#     predict,
+#     accept_length,
+#     simulate_acc_len,
+#     bs,
+#     spec_steps,
+# ):
+#     simulate_acc_len_float = float(simulate_acc_len)
+#     simulated_values = torch.normal(
+#         mean=simulate_acc_len_float,
+#         std=1.0,
+#         size=(1,),
+#         device="cpu",
+#     )
+#     # clamp simulated values to be between 1 and self.spec_steps
+#     simulated_values = torch.clamp(simulated_values, min=1.0, max=spec_steps)
+#     simulate_acc_len = int(simulated_values.round().item())
 
-    accept_indx_first_col = accept_index[:, 0].view(-1, 1)
-    sim_accept_index = torch.full(
-        (bs, spec_steps + 1), -1, dtype=torch.int32, device="cuda"
-    )
-    sim_accept_index[:, :simulate_acc_len] = accept_indx_first_col + torch.arange(
-        simulate_acc_len, device=accept_index.device
-    )
-    accept_length.fill_(simulate_acc_len - 1)
-    predict.fill_(100)  # some legit token id
-    return sim_accept_index
+#     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
+#     sim_accept_index = torch.full(
+#         (bs, spec_steps + 1), -1, dtype=torch.int32, device="cuda"
+#     )
+#     sim_accept_index[:, :simulate_acc_len] = accept_indx_first_col + torch.arange(
+#         simulate_acc_len, device=accept_index.device
+#     )
+#     accept_length.fill_(simulate_acc_len - 1)
+#     predict.fill_(100)  # some legit token id
+#     return sim_accept_index
 
 
 def traverse_tree(
