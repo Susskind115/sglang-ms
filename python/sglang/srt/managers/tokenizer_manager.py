@@ -992,7 +992,9 @@ class TokenizerManager:
         responses: List[SetInternalStateReqOutput] = (
             await self.set_internal_state_communicator(obj)
         )
-        return [res.internal_state for res in responses]
+        if not responses:
+            raise RuntimeError("set_internal_state returned no responses.")
+        return responses[0]
 
     def get_log_request_metadata(self):
         max_length = None

@@ -225,6 +225,13 @@ class ModelHub:
         self.lazy_switch_strategy = None
         self.lazy_switch_diff = None
         self.process_lazy_switch = False
+        self._chain_selected_counts = defaultdict(int)
+        self._chain_applied_counts = defaultdict(int)
+        self._chain_observed_counts = defaultdict(int)
+        self._chain_search_count = 0
+        self._chain_switch_count = 0
+        self._chain_lazy_switch_count = 0
+        self._last_selected_chain: Optional[Tuple[str, ...]] = None
 
         # self.worker_map = {worker.model_name: worker for worker in self.model_workers}
         self.server_args_map = {
@@ -232,6 +239,7 @@ class ModelHub:
         }
 
         self._chain_last_applied = self._current_chain_ids()
+        self._record_applied_chain(self._chain_last_applied)
         self._init_chain_components(selected_server_args_list)
         self.warmup_model_hub()
 
@@ -1203,7 +1211,10 @@ class ModelHub:
         # self._refresh_capture_modes(chain)
         if update_scheduler and self.chain_scheduler:
             self.chain_scheduler.update_model_chain(chain)
+        if self._chain_last_applied and self._chain_last_applied != tuple(chain):
+            self._chain_switch_count += 1
         self._chain_last_applied = tuple(chain)
+        self._record_applied_chain(self._chain_last_applied)
 
     # def _refresh_capture_modes(self, chain: Sequence[str]) -> None:
     #     if not chain:
@@ -1317,11 +1328,59 @@ class ModelHub:
         if self.lazy_switch_strategy is not None:
             return self.lazy_switch_strategy
         return self.current_chain_strategy
+
+    @staticmethod
+    def _chain_key(chain: Optional[Sequence[str]]) -> str:
+        if not chain:
+            return "EMPTY"
+        return " -> ".join(chain)
+
+    def _record_selected_chain(self, chain: Optional[Sequence[str]]) -> None:
+        if not chain:
+            return
+        chain_tuple = tuple(chain)
+        self._last_selected_chain = chain_tuple
+        self._chain_selected_counts[self._chain_key(chain_tuple)] += 1
+
+    def _record_applied_chain(self, chain: Optional[Sequence[str]]) -> None:
+        if not chain:
+            return
+        self._chain_applied_counts[self._chain_key(tuple(chain))] += 1
+
+    def _record_observed_chain(self, chain: Optional[Sequence[str]]) -> None:
+        if not chain:
+            return
+        self._chain_observed_counts[self._chain_key(tuple(chain))] += 1
+
+    def get_runtime_stats(self) -> Dict[str, object]:
+        current_strategy = self.get_current_chain_strategy()
+        return {
+            "current_chain_ids": list(current_strategy.current_chain_ids),
+            "current_mode": current_strategy.mode.value,
+            "process_lazy_switch": self.process_lazy_switch,
+            "lazy_chain_ids": (
+                list(self.lazy_switch_strategy.current_chain_ids)
+                if self.lazy_switch_strategy is not None
+                else None
+            ),
+            "last_selected_chain": (
+                list(self._last_selected_chain)
+                if self._last_selected_chain is not None
+                else None
+            ),
+            "search_count": self._chain_search_count,
+            "switch_count": self._chain_switch_count,
+            "lazy_switch_count": self._chain_lazy_switch_count,
+            "selected_chain_counts": dict(sorted(self._chain_selected_counts.items())),
+            "applied_chain_counts": dict(sorted(self._chain_applied_counts.items())),
+            "observed_chain_counts": dict(sorted(self._chain_observed_counts.items())),
+        }
     
     
     def check_switch_mode(self, batch: ScheduleBatch):
         # if get_rank() == 0:
         #     logger.info(f"check_switch_mode, ")
+        self._record_observed_chain(self.get_current_chain_strategy().current_chain_ids)
         if self.chain_scheduler is None:
             self.current_batch_probs = None
             return
@@ -1343,6 +1402,7 @@ class ModelHub:
         # min_accept_length = -1
         # with count_time("search_chain"):
         objects_to_sync = [None, None, None]
+        self._chain_search_count += 1
         with count_time("search_chain"):
             if get_rank() == 0:
                 if self.first_prefill_pass:
@@ -1363,6 +1423,7 @@ class ModelHub:
         # logger.info(f"cascade_list: {cascade_list}")
         # logger.info(f"cur: {self._current_chain_ids()} ")
         if selected_chain is not None:
+            self._record_selected_chain(selected_chain)
             # if len(selected_chain) > 1:
             #     self.update_spec_config_from_dp(dp_details)
             # self.switch_thresh = 8
@@ -1480,6 +1541,7 @@ class ModelHub:
             self.process_lazy_switch = False
 
         if not diff.non_diff:
+            self._chain_lazy_switch_count += 1
             self.lazy_switch_strategy = new_strategy
             self.lazy_switch_diff = diff
             self.process_lazy_switch = True
@@ -1953,7 +2015,15 @@ class ModelHub:
 
             if len(self.lazy_switch_diff.unload_models) > 0:
                 # 本次推理已经结束，准备下掉所有模型。
-                self.state_manager.save_model_history(self.lazy_switch_diff.unload_models, batch.req_pool_indices, batch.seq_lens, batch.spec_info.accept_length, stage_name="reconfig")
+                # Reconfig runs on the unfinished-request subset prepared for
+                # draft_extend, so use the matching request/length tensors here.
+                self.state_manager.save_model_history(
+                    self.lazy_switch_diff.unload_models,
+                    batch.spec_info.req_pool_indices_for_draft_extend,
+                    batch.spec_info.seq_lens_for_draft_extend,
+                    batch.spec_info.accept_length_for_draft_extend,
+                    stage_name="reconfig",
+                )
 
 
             # if self.current_chain_strategy.mode == InferenceMode.SPECULATIVE and self.lazy_switch_strategy.mode == InferenceMode.AUTOREGRESSIVE:
@@ -2073,7 +2143,9 @@ class ModelHub:
                 last_worker_name=last_worker_name,
                 submit_flag=self.submit_flag,
                 keep_req_pool_indices_len=len(keep_req_pool_indices),
-                keep_reqs_index_len=len(keep_reqs_index),
+                keep_reqs_index_len=(
+                    len(keep_reqs_index) if keep_reqs_index is not None else None
+                ),
                 batch=describe_batch(batch),
             )
 

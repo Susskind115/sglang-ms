@@ -2272,6 +2272,8 @@ class Scheduler(
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
         ret["true_batch_stats"] = self.true_batch_tracker.snapshot()
+        if getattr(self, "model_hub", None) is not None:
+            ret["chain_runtime_stats"] = self.model_hub.get_runtime_stats()
         return GetInternalStateReqOutput(
             internal_state=ret,
         )
