@@ -748,10 +748,17 @@ class TpModelWorker:
 
         # Forward multiple steps
         scores = None
+        use_compiled_topk = not self.speculative_algorithm.is_eagle3()
         # print("hidden_states draft_forward", hidden_states)
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
+                i,
+                topk_p,
+                topk_index,
+                hidden_states,
+                scores,
+                self.topk,
+                use_compiled=use_compiled_topk,
             )
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])

@@ -1537,8 +1537,7 @@ def align_evict_mask_to_page_size(
 #     return input_ids, hidden_states, scores, tree_info
 
 
-@torch.compile(dynamic=True)
-def _select_top_k_init(
+def _select_top_k_init_impl(
     topk_p: torch.Tensor,
     topk_index: torch.Tensor,
     hidden_states: Optional[torch.Tensor],
@@ -1558,8 +1557,7 @@ def _select_top_k_init(
     )
     return input_ids, hidden_states, scores, tree_info
 
-@torch.compile(dynamic=True)
-def _select_top_k_decode(
+def _select_top_k_decode_impl(
     i_tensor: torch.Tensor,
     topk_p: torch.Tensor,
     topk_index: torch.Tensor,
@@ -1593,6 +1591,10 @@ def _select_top_k_decode(
 
     return input_ids, hidden_states, scores, tree_info
 
+
+_select_top_k_init = torch.compile(dynamic=True)(_select_top_k_init_impl)
+_select_top_k_decode = torch.compile(dynamic=True)(_select_top_k_decode_impl)
+
 def select_top_k_tokens(
     i: int,
     topk_p: torch.Tensor,
@@ -1600,9 +1602,12 @@ def select_top_k_tokens(
     hidden_states: Optional[torch.Tensor],
     scores: torch.Tensor,
     topk: int,
+    use_compiled: bool = True,
 ):
+    select_init = _select_top_k_init if use_compiled else _select_top_k_init_impl
+    select_decode = _select_top_k_decode if use_compiled else _select_top_k_decode_impl
     if i == 0:
-        return _select_top_k_init(
+        return select_init(
             topk_p, 
             topk_index, 
             hidden_states, 
@@ -1610,7 +1615,7 @@ def select_top_k_tokens(
         )
     else:
         i_tensor = torch.tensor(i, device=topk_index.device, dtype=torch.long)
-        return _select_top_k_decode(
+        return select_decode(
             i_tensor,
             topk_p,
             topk_index,

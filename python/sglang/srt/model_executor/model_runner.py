@@ -71,6 +71,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     TokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.paged_allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.model_executor import expert_location_updater
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
@@ -957,9 +958,16 @@ class ModelRunner:
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
         else:
+            # Use swa dimensions for memory calc when available (pool stores swa size)
+            kv_heads = self.model_config.get_num_kv_heads(get_attention_tp_size())
+            kv_head_dim = self.model_config.head_dim
+            if getattr(self.model_config, "swa_num_kv_heads", None) is not None:
+                kv_heads = max(1, self.model_config.swa_num_kv_heads // get_attention_tp_size())
+            if getattr(self.model_config, "swa_head_dim", None) is not None:
+                kv_head_dim = self.model_config.swa_head_dim
             cell_size = (
-                self.model_config.get_num_kv_heads(get_attention_tp_size())
-                * self.model_config.head_dim
+                kv_heads
+                * kv_head_dim
                 * num_layers
                 * 2
                 * torch._utils._element_size(self.kv_cache_dtype)
@@ -1042,9 +1050,16 @@ class ModelRunner:
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
         else:
+            # Use swa dimensions for memory calc when available (pool stores swa size)
+            kv_heads = self.model_config.get_num_kv_heads(get_attention_tp_size())
+            kv_head_dim = self.model_config.head_dim
+            if getattr(self.model_config, "swa_num_kv_heads", None) is not None:
+                kv_heads = max(1, self.model_config.swa_num_kv_heads // get_attention_tp_size())
+            if getattr(self.model_config, "swa_head_dim", None) is not None:
+                kv_head_dim = self.model_config.swa_head_dim
             cell_size = (
-                self.model_config.get_num_kv_heads(get_attention_tp_size())
-                * self.model_config.head_dim
+                kv_heads
+                * kv_head_dim
                 * num_layers
                 * 2
                 * torch._utils._element_size(self.kv_cache_dtype)
@@ -1195,18 +1210,51 @@ class ModelRunner:
                 end_layer=self.end_layer,
             )
         else:
-            self.token_to_kv_pool = MHATokenToKVPool(
-                self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
-                head_dim=self.model_config.head_dim,
-                layer_num=self.num_effective_layers,
-                device=self.device,
-                enable_memory_saver=self.server_args.enable_memory_saver,
-                start_layer=self.start_layer,
-                end_layer=self.end_layer,
-            )
+            swa_head_dim = getattr(self.model_config, "swa_head_dim", None)
+            swa_num_kv_heads = getattr(self.model_config, "swa_num_kv_heads", None)
+            layer_types = getattr(self.model_config.hf_text_config, "layer_types", None)
+
+            if swa_head_dim is not None and layer_types is not None:
+                # Mixed head-dim model (e.g. Gemma4): use SWAKVPool with two sub-pools
+                tp = get_attention_tp_size()
+                swa_ids = [i for i, t in enumerate(layer_types) if t == "sliding_attention"]
+                full_ids = [i for i, t in enumerate(layer_types) if t == "full_attention"]
+
+                full_head_dim = self.model_config.head_dim
+                global_kv_heads = getattr(self.model_config.hf_text_config, "num_global_key_value_heads", None)
+                if global_kv_heads is not None:
+                    full_kv_heads = max(1, global_kv_heads // tp)
+                else:
+                    full_kv_heads = self.model_config.get_num_kv_heads(tp)
+                # If full head_dim > FA limit (256), we use SDPA fallback in model code,
+                # so the pool stores at the original (non-split) dimensions.
+
+                self.token_to_kv_pool = SWAKVPool(
+                    size=self.max_total_num_tokens,
+                    size_swa=self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=full_kv_heads,
+                    head_dim=full_head_dim,
+                    swa_head_num=max(1, swa_num_kv_heads // tp) if swa_num_kv_heads else self.model_config.get_num_kv_heads(tp),
+                    swa_head_dim=swa_head_dim,
+                    swa_attention_layer_ids=swa_ids,
+                    full_attention_layer_ids=full_ids,
+                    device=self.device,
+                )
+            else:
+                self.token_to_kv_pool = MHATokenToKVPool(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
+                    head_dim=self.model_config.head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                )
 
         if self.token_to_kv_pool_allocator is None:
             if self.page_size == 1:

@@ -268,6 +268,8 @@ class MHATokenToKVPool(KVCache):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
+        swa_head_num: Optional[int] = None,
+        swa_head_dim: Optional[int] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
@@ -282,8 +284,10 @@ class MHATokenToKVPool(KVCache):
             end_layer,
         )
 
-        self.head_num = head_num
-        self.head_dim = head_dim
+        # When swa params are given, use them as the pool storage dimension
+        # (sliding-window layers are the majority and determine the pool shape).
+        self.head_num = swa_head_num if swa_head_num is not None else head_num
+        self.head_dim = swa_head_dim if swa_head_dim is not None else head_dim
         self._create_buffers()
 
         self.layer_transfer_counter = None
@@ -405,10 +409,11 @@ class MHATokenToKVPool(KVCache):
         cache_v: torch.Tensor,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
-        layer_id = layer.layer_id
+        layer_id = layer_id_override if layer_id_override is not None else layer.layer_id
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)

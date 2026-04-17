@@ -1619,3 +1619,18 @@ def auto_choose_speculative_params(arch: str):
     else:
         # The default value for all other models
         return (5, 4, 8)
+
+
+# [EAGLE3_DEBUG] global server args stub for Gemma4 MoE path compatibility
+_global_server_args = None
+
+
+def set_global_server_args(args):
+    global _global_server_args
+    _global_server_args = args
+
+
+def get_global_server_args():
+    if _global_server_args is None:
+        raise ValueError("Global server args is not set yet!")
+    return _global_server_args

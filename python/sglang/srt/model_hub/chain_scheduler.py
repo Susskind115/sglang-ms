@@ -13,6 +13,7 @@ import math
 import random
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
+import os
 import numpy as np
 import torch
 import logging
@@ -640,6 +641,23 @@ class CascadeOptimizer:
             #     self.dp_verify_cache[i] = v_gamma_max
             # else:
             #     self.dp_verify_cache[i] = 0.0
+
+        # [EAGLE3_DEBUG] solver diagnostic dump
+        if os.path.exists("/tmp/EAGLE3_DEBUG_CHAIN"):
+            logger.info(
+                f"[EAGLE3_DEBUG] CascadeOptimizer.solve | "
+                f"bs={current_bs} "
+                f"model_names={self.model_names} "
+                f"dp_cost={self.dp_cost.tolist()} "
+                f"dp_prev={self.dp_prev.tolist()} "
+                f"dp_gamma={self.dp_gamma.tolist()} "
+                f"t_decode={t_decode.tolist()} "
+                f"t_verify_slope={t_verify_slope.tolist()} "
+                f"t_verify_bias={t_verify_bias.tolist()} "
+                f"t_verify_runtime={t_verify_runtime.tolist()} "
+                f"alpha_matrix={self.alpha_matrix.tolist()} "
+                f"compat_matrix={self.compatibility_matrix.tolist()}"
+            )
 
     def get_optimal_strategy(self, target_model_name: str, min_accept_length: int) -> List[Dict]:
         # idx = self.model_names.index(target_model_name)

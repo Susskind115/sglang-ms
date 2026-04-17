@@ -300,6 +300,8 @@ class LogitsProcessor(nn.Module):
             input_logprob_indices_pt = 0
             input_logprob_indices = []
             pt, pruned_states = 0, []
+            if aux_hidden_states is not None:
+                aux_pruned_states = [[] for _ in aux_hidden_states]
             for extend_logprob_start_len, extend_len in zip(
                 logits_metadata.extend_logprob_start_lens_cpu,
                 logits_metadata.extend_seq_lens_cpu,
@@ -315,6 +317,11 @@ class LogitsProcessor(nn.Module):
                 # by a caller.
                 assert extend_len > start_len
                 pruned_states.append(hidden_states[pt + start_len : pt + extend_len])
+                if aux_hidden_states is not None:
+                    for aux_idx, aux_hidden in enumerate(aux_hidden_states):
+                        aux_pruned_states[aux_idx].append(
+                            aux_hidden[pt + start_len : pt + extend_len]
+                        )
                 pt += extend_len
                 sample_index_pt += extend_len - start_len
                 sample_indices.append(sample_index_pt)
@@ -327,6 +334,10 @@ class LogitsProcessor(nn.Module):
                 input_logprob_indices_pt += extend_len - start_len
 
             pruned_states = torch.cat(pruned_states)
+            if aux_hidden_states is not None:
+                aux_pruned_states = [
+                    torch.cat(hidden_group, dim=0) for hidden_group in aux_pruned_states
+                ]
             sample_indices = torch.tensor(
                 sample_indices, device=pruned_states.device, dtype=torch.int64
             )

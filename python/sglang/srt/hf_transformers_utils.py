@@ -103,6 +103,42 @@ def get_hf_text_config(config: PretrainedConfig):
         return config
 
 
+def _build_eagle3_speculator_config(model_path, raw_config):
+    """Flatten Eagle3Speculator (speculators library) nested config into LlamaConfig."""
+    import json
+    from transformers import LlamaConfig
+
+    layer_cfg = raw_config.get("transformer_layer_config", {})
+
+    config = LlamaConfig(
+        hidden_size=layer_cfg.get("hidden_size"),
+        num_attention_heads=layer_cfg.get("num_attention_heads"),
+        num_key_value_heads=layer_cfg.get("num_key_value_heads"),
+        num_hidden_layers=layer_cfg.get("num_hidden_layers", 1),
+        intermediate_size=layer_cfg.get("intermediate_size"),
+        hidden_act=layer_cfg.get("hidden_act", "silu"),
+        rms_norm_eps=layer_cfg.get("rms_norm_eps", 1e-6),
+        vocab_size=layer_cfg.get("vocab_size"),
+        max_position_embeddings=layer_cfg.get("max_position_embeddings", 40960),
+        rope_theta=layer_cfg.get("rope_theta", 10000),
+        rope_scaling=layer_cfg.get("rope_scaling"),
+        attention_bias=layer_cfg.get("attention_bias", False),
+        torch_dtype=raw_config.get("torch_dtype", "bfloat16"),
+        tie_word_embeddings=False,
+    )
+
+    config.architectures = ["Eagle3Speculator"]
+    config.draft_vocab_size = raw_config.get("draft_vocab_size", 32000)
+    config.norm_before_residual = raw_config.get("norm_before_residual", False)
+    if "head_dim" in layer_cfg:
+        config.head_dim = layer_cfg["head_dim"]
+    if raw_config.get("target_hidden_size") is not None:
+        config.target_hidden_size = raw_config["target_hidden_size"]
+    config._name_or_path = model_path
+
+    return config
+
+
 def get_config(
     model: str,
     trust_remote_code: bool,
@@ -114,6 +150,20 @@ def get_config(
     if is_gguf:
         kwargs["gguf_file"] = model
         model = Path(model).parent
+
+    # Intercept Eagle3Speculator configs (speculators library format)
+    # that lack model_type and cannot be loaded by AutoConfig
+    if isinstance(model, (str, Path)):
+        import json
+        config_path = os.path.join(str(model), "config.json")
+        if os.path.isfile(config_path):
+            with open(config_path) as f:
+                raw_cfg = json.load(f)
+            if raw_cfg.get("architectures") == ["Eagle3Speculator"]:
+                config = _build_eagle3_speculator_config(str(model), raw_cfg)
+                if model_override_args:
+                    config.update(model_override_args)
+                return config
 
     config = AutoConfig.from_pretrained(
         model, trust_remote_code=trust_remote_code, revision=revision, **kwargs

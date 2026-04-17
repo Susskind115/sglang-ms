@@ -83,10 +83,14 @@ class RotaryEmbedding(CustomOp):
         if not _is_cuda:
             cache = cache.to(dtype)
 
+        self.vllm_rotary_embedding = None
         if not _is_cuda or self.head_size not in [64, 128, 256, 512]:
-            from vllm._custom_ops import rotary_embedding
+            try:
+                from vllm._custom_ops import rotary_embedding
 
-            self.vllm_rotary_embedding = rotary_embedding
+                self.vllm_rotary_embedding = rotary_embedding
+            except ImportError:
+                self.vllm_rotary_embedding = None
 
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
@@ -191,6 +195,8 @@ class RotaryEmbedding(CustomOp):
                 is_neox=self.is_neox_style,
             )
         else:
+            if self.vllm_rotary_embedding is None:
+                return self.forward_native(positions, query, key, offsets)
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
             self.vllm_rotary_embedding(
                 positions,

@@ -19,6 +19,7 @@ from sglang.srt.utils import add_prefix
 # https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/cnets.py
 """Inference-only LLaMA-EAGLE model compatible with HuggingFace weights."""
 
+import copy
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -60,6 +61,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         )
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm_before_residual = getattr(config, "norm_before_residual", False)
 
     def forward(
         self,
@@ -70,9 +72,16 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        residual = hidden_states
         embeds = self.input_layernorm(embeds)
-        hidden_states = self.hidden_norm(hidden_states)
+
+        if self.norm_before_residual:
+            # speculators Eagle3Speculator: norm hidden first, then use as residual
+            hidden_states = self.hidden_norm(hidden_states)
+            residual = hidden_states
+        else:
+            # original EAGLE3 (LlamaForCausalLMEagle3): save raw hidden as residual
+            residual = hidden_states
+            hidden_states = self.hidden_norm(hidden_states)
 
         hidden_states = torch.cat([embeds, hidden_states], dim=-1)
 
@@ -107,10 +116,15 @@ class LlamaModel(nn.Module):
             prefix=add_prefix("embed_tokens", prefix),
         )
         self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
-        if hasattr(config, "target_hidden_size"):
-            self.fc = torch.nn.Linear(config.target_hidden_size * 3, config.hidden_size)
+        if hasattr(config, "target_hidden_size") and config.target_hidden_size is not None:
+            hidden_size_in = config.target_hidden_size
         else:
-            self.fc = torch.nn.Linear(config.hidden_size * 3, config.hidden_size)
+            hidden_size_in = config.hidden_size
+        self.fc = torch.nn.Linear(
+            hidden_size_in * 3,
+            config.hidden_size,
+            bias=getattr(config, "bias", False),
+        )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -131,6 +145,10 @@ class LlamaModel(nn.Module):
         if hidden_states.shape[-1] != embeds.shape[-1]:
             hidden_states = self.fc(hidden_states)
 
+        # idle batch guard
+        if hidden_states.shape[0] == 0:
+            return hidden_states, [hidden_states]
+
         residual = None
         hidden_states, residual = self.midlayer(
             positions,
@@ -146,6 +164,9 @@ class LlamaModel(nn.Module):
 
         # For draft decode, we capture the hidden state before norm
         return hidden_states_to_logits, [hidden_states_to_aux]
+
+    def update_max_cos_sin_cache(self, max_cos_sin_cache_lens: int):
+        self.midlayer.update_max_cos_sin_cache(max_cos_sin_cache_lens)
 
 
 class LlamaForCausalLMEagle3(LlamaForCausalLM):
@@ -168,9 +189,13 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         )
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
+        self.load_lm_head_from_target = False
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
+            if config.draft_vocab_size is None:
+                self.load_lm_head_from_target = True
+                config.draft_vocab_size = config.vocab_size
             self.lm_head = ParallelLMHead(
                 config.draft_vocab_size,
                 config.hidden_size,
@@ -178,8 +203,13 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                 prefix=add_prefix("lm_head", prefix),
             )
 
-        self.logits_processor = LogitsProcessor(config)
+        # draft logits processor uses draft_vocab_size, not full target vocab_size
+        config_ = copy.deepcopy(config)
+        config_.vocab_size = config_.draft_vocab_size
+        self.logits_processor = LogitsProcessor(config_)
+
         self.capture_aux_hidden_states = True
+        self.hot_token_id = None
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         for name, loaded_weight in weights:
@@ -197,4 +227,23 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         return self.hot_token_id
 
 
-EntryClass = [LlamaForCausalLMEagle3]
+class Eagle3Speculator(LlamaForCausalLMEagle3):
+    """Adapter for Eagle3Speculator (speculators library format) weight layout.
+
+    Handles:
+    - Weight key remapping: layers.0.xxx -> midlayer.xxx
+    - norm_before_residual config propagation
+    """
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def _remap(weights):
+            for name, tensor in weights:
+                # speculators format: layers.0.xxx -> sglang format: midlayer.xxx
+                if name.startswith("layers.0."):
+                    name = "midlayer." + name[len("layers.0."):]
+                yield name, tensor
+
+        super().load_weights(_remap(weights))
+
+
+EntryClass = [LlamaForCausalLMEagle3, Eagle3Speculator]

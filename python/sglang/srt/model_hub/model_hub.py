@@ -147,6 +147,11 @@ class ModelHub:
         self.enabled_skip_extend = router_args["enabled_skip_extend"]
         self.switch_thresh = router_args["switch_thresh"]
         self.first_prefill_pass = False
+        # exploration mechanism to break positive-feedback deadlock
+        self._explore_interval = 30
+        self._explore_burst = 2
+        self._explore_count = 0
+        self._explore_remaining = 0
         # logger.info(f"switch_thresh: {self.switch_thresh}")
         # self.mode_switch_enabled = router_args.get("mode_switch_enabled", True)
         # 默认配置
@@ -353,6 +358,16 @@ class ModelHub:
                 compatibility_matrix[i, :] = False
                 compatibility_matrix[:, i] = False
                 compatibility_matrix[i, name_to_idx[draft_worker.base_model_name]] = True
+
+                # For EAGLE3 draft models, the target model must capture
+                # intermediate-layer aux hidden states (3x hidden_size)
+                # so the draft model's fc layer can transform them properly.
+                if draft_worker.speculative_algorithm.is_eagle3():
+                    target_worker = self.worker_map[draft_worker.base_model_name]
+                    target_model = target_worker.model_runner.model
+                    if hasattr(target_model, "set_eagle3_layers_to_capture"):
+                        target_model.set_eagle3_layers_to_capture()
+                        target_worker.model_runner.capture_aux_hidden_states = True
         self.compatibility_matrix = compatibility_matrix
 
         # 初始化main_model_worker的memory pool
@@ -696,7 +711,10 @@ class ModelHub:
                     hidden_shape = (batch_size, hidden_size)
                 hidden_states = torch.randn(hidden_shape, device=device, dtype=dtype)
 
-        vocab_size = getattr(runner.model_config, "vocab_size", None)
+        if worker.speculative_algorithm.is_eagle3():
+            vocab_size = getattr(runner.model_config, "draft_vocab_size", None)
+        else:
+            vocab_size = getattr(runner.model_config, "vocab_size", None)
         if not vocab_size:
             vocab_size = 32000
         logits_dtype = torch.float32
@@ -759,8 +777,8 @@ class ModelHub:
         # )
         # self.req_probs_count_protect_threshold = 0.0
         self.req_probs_count_protect_threshold = 5.0
-        self.req_probs_init = 0.6
-        # self.req_probs_init = 0.9
+        self.req_probs_init = 0.9
+        # self.req_probs_init = 0.6
         self.req_probs_latest = torch.full((size, num_models, num_models), self.req_probs_init, device=device, dtype=dtype)
         # self.req_probs_latest = (
         #     torch.eye(num_models, device=device, dtype=dtype)
@@ -1186,6 +1204,27 @@ class ModelHub:
         # if tuple(selected_chain) != self._chain_last_applied:
         #     self._apply_model_chain(selected_chain)
 
+        # [EAGLE3_DEBUG] chain scheduler decision diagnostic
+        if os.path.exists("/tmp/EAGLE3_DEBUG_CHAIN") and get_rank() == 0:
+            opt = self.chain_scheduler.optimizer
+            tm = self.chain_scheduler.time_manager
+            logger.info(
+                f"[EAGLE3_DEBUG] _search_chain | "
+                f"bs={self.current_batch_size} min_accept={min_accept_length} "
+                f"alpha_matrix={opt.alpha_matrix.tolist()} "
+                f"dp_cost={opt.dp_cost.tolist()} "
+                f"dp_prev={opt.dp_prev.tolist()} "
+                f"dp_gamma={opt.dp_gamma.tolist()} "
+                f"t_decode_base={tm.warmup_decode_base.tolist()} "
+                f"t_decode_slope={tm.warmup_decode_slope.tolist()} "
+                f"t_decode_runtime={tm.runtime_decode_unit.tolist()} "
+                f"t_verify_slope={tm.warmup_verify_slope.tolist()} "
+                f"t_verify_runtime={tm.runtime_verify_unit.tolist()} "
+                f"batch_probs={self.current_batch_probs.tolist() if self.current_batch_probs is not None else None} "
+                f"selected_chain={cascade_list['chain']} "
+                f"dp_details={cascade_list['dp_details']}"
+            )
+
         return cascade_list, cascade_list['chain'], cascade_list['dp_details']
 
     def _maybe_apply_model_chain(
@@ -1378,6 +1417,9 @@ class ModelHub:
     
     
     def check_switch_mode(self, batch: ScheduleBatch):
+        # [EAGLE3_DEBUG] unconditional entry trace
+        if get_rank() == 0:
+            logger.info(f"[EAGLE3_DEBUG] check_switch_mode ENTRY | chain_scheduler={self.chain_scheduler is not None} first_prefill={self.first_prefill_pass} flag_file={os.path.exists('/tmp/EAGLE3_DEBUG_CHAIN')}")
         # if get_rank() == 0:
         #     logger.info(f"check_switch_mode, ")
         self._record_observed_chain(self.get_current_chain_strategy().current_chain_ids)
@@ -1422,12 +1464,54 @@ class ModelHub:
         )
         # logger.info(f"cascade_list: {cascade_list}")
         # logger.info(f"cur: {self._current_chain_ids()} ")
+
+        # [EAGLE3_DEBUG] force full chain override for control experiment
+        if selected_chain is not None and os.path.exists("/tmp/EAGLE3_FORCE_FULL_CHAIN"):
+            original_chain = selected_chain
+            selected_chain = self.chain_scheduler.full_model_ids[:]
+            if os.path.exists("/tmp/EAGLE3_DEBUG_CHAIN") and get_rank() == 0:
+                logger.info(
+                    f"[EAGLE3_DEBUG] FORCE_FULL_CHAIN | "
+                    f"original={original_chain} forced={selected_chain}"
+                )
+
+        # exploration: periodically force full chain when solver chose shorter chain
+        if selected_chain is not None and self.chain_scheduler is not None:
+            full_ids = self.chain_scheduler.full_model_ids
+            if self._explore_remaining > 0:
+                self._explore_remaining -= 1
+                selected_chain = full_ids[:]
+            elif len(selected_chain) < len(full_ids):
+                self._explore_count += 1
+                if self._explore_count >= self._explore_interval:
+                    self._explore_count = 0
+                    self._explore_remaining = self._explore_burst - 1
+                    selected_chain = full_ids[:]
+                    if get_rank() == 0:
+                        logger.info(
+                            f"[EAGLE3_DEBUG] exploration triggered | "
+                            f"forcing full chain for {self._explore_burst} steps"
+                        )
+
         if selected_chain is not None:
             self._record_selected_chain(selected_chain)
+
+            # [EAGLE3_DEBUG] check_switch_mode decision log
+            if os.path.exists("/tmp/EAGLE3_DEBUG_CHAIN") and get_rank() == 0:
+                current_ids = self._current_chain_ids()
+                logger.info(
+                    f"[EAGLE3_DEBUG] check_switch_mode | "
+                    f"search_count={self._chain_search_count} "
+                    f"current_chain={current_ids} "
+                    f"selected_chain={selected_chain} "
+                    f"same_as_current={current_ids == list(selected_chain)} "
+                    f"batch_size={batch.batch_size()}"
+                )
+
             # if len(selected_chain) > 1:
             #     self.update_spec_config_from_dp(dp_details)
             # self.switch_thresh = 8
-            
+
             # if batch.batch_size() < self.switch_thresh:
             #     # selected_chain = [self.full_model_ids[1], self.full_model_ids[-1]]
             #     # selected_chain = [self.full_model_ids[0], self.full_model_ids[1], self.full_model_ids[-1]]
@@ -1779,6 +1863,19 @@ class ModelHub:
             # self.check_submit(verify_output, exec_worker_name)
             next_token_ids = verify_output.verified_id
             num_accepted_tokens = sum(verify_output.accept_length_per_req_cpu)
+
+            # [EAGLE3_DEBUG] per-joint accept tracking for three-chain diagnosis
+            if os.environ.get("EAGLE3_DEBUG_VERIFY", "0") == "1":
+                is_target = (exec_worker_name == self.model_router.target_model_name)
+                logger.info(
+                    f"[EAGLE3_DEBUG] verify joint | verifier={exec_worker_name} "
+                    f"| is_final_target={is_target} "
+                    f"| drafter={last_worker_name} "
+                    f"| batch_size={batch.batch_size()} "
+                    f"| accept_per_req={verify_output.accept_length_per_req_cpu} "
+                    f"| total_accepted={num_accepted_tokens} "
+                    f"| mean_accept={num_accepted_tokens/max(batch.batch_size(),1):.2f}"
+                )
             specrouter_debug_log(
                 logger,
                 "verify_state_complete",
@@ -2462,15 +2559,20 @@ class ModelHub:
                 draft_worker.capture_for_decode(logits_output_draft, batch.spec_info)
                 # if dist_map:
                 #     self._update_similarity_with_probabilities(dist_map)3
-                dtype = self.req_probs_latest.dtype
-                if len(all_logits_list) > 1:
-                    stacked_logits = torch.stack(all_logits_list, dim=0).to(dtype)
-                else:
-                    stacked_logits = all_logits_list[0].unsqueeze(0).to(dtype)
-                similarity_matrix = self._batch_compute_and_update_similarity(stacked_logits, weights_list)
-            
-                # logger.info(f"self.similarity_matrix: {similarity_matrix}")
-                self._update_req_probs_from_prefill(batch, similarity_matrix, model_names_in_order, 1)
+                if self.chain_scheduler is not None and self.req_probs_latest is not None:
+                    vocab_dims = {tensor.shape[-1] for tensor in all_logits_list}
+                    if len(vocab_dims) == 1:
+                        dtype = self.req_probs_latest.dtype
+                        if len(all_logits_list) > 1:
+                            stacked_logits = torch.stack(all_logits_list, dim=0).to(dtype)
+                        else:
+                            stacked_logits = all_logits_list[0].unsqueeze(0).to(dtype)
+                        similarity_matrix = self._batch_compute_and_update_similarity(
+                            stacked_logits, weights_list
+                        )
+                        self._update_req_probs_from_prefill(
+                            batch, similarity_matrix, model_names_in_order, 1
+                        )
             # logger.info(f"batch.spec_info: prefill end  {batch.spec_info}, {draft_worker}")
 
 

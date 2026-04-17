@@ -153,6 +153,27 @@ class ModelConfig:
             self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
         )
 
+        # For models with mixed sliding/full attention (e.g. Gemma4),
+        # use global_head_dim as the canonical head_dim and store
+        # the smaller sliding-window head_dim separately.
+        self.swa_head_dim = getattr(
+            self.hf_text_config, "swa_head_dim", None
+        )
+        global_head_dim = getattr(self.hf_text_config, "global_head_dim", None)
+        if global_head_dim is not None and global_head_dim != self.head_dim:
+            self.swa_head_dim = self.head_dim
+            self.head_dim = global_head_dim
+
+        self.swa_num_kv_heads = getattr(
+            self.hf_text_config, "swa_num_key_value_heads", None
+        )
+        global_kv_heads = getattr(self.hf_text_config, "num_global_key_value_heads", None)
+        if global_kv_heads is not None:
+            if self.swa_num_kv_heads is None:
+                self.swa_num_kv_heads = getattr(
+                    self.hf_text_config, "num_key_value_heads", None
+                )
+
         # FIXME: temporary special judge for MLA architecture
         if (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures

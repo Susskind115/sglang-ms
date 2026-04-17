@@ -176,6 +176,43 @@ class Gemma3RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
+class Gemma4RMSNorm(nn.Module):
+    """RMSNorm for Gemma4, supports optional scale_shift and with_scale flag."""
+
+    def __init__(
+        self,
+        dim: int,
+        eps: float = 1e-6,
+        scale_shift: float = 0.0,
+        with_scale: bool = True,
+    ):
+        super().__init__()
+        self.with_scale = with_scale
+        self.eps = eps
+        self.scale_shift = scale_shift
+
+        if self.with_scale:
+            self.weight = nn.Parameter(torch.ones(dim))
+        else:
+            self.register_buffer("weight", torch.ones(dim), persistent=False)
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float())
+        if self.with_scale:
+            output = output * (self.weight.float() + self.scale_shift)
+        return output.type_as(x)
+
+    def __repr__(self):
+        dim = self.weight.shape[0]
+        return (
+            f"{self.__class__.__name__}(dim={dim}, eps={self.eps}, "
+            f"with_scale={self.with_scale}, scale_shift={self.scale_shift})"
+        )
+
+
 if not (_is_cuda or _is_hip):
     logger.info(
         "sgl-kernel layernorm implementation is not available on current platform. Fallback to other kernel libraries."
