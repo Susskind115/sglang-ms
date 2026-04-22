@@ -574,8 +574,9 @@ class EagleDraftInput:
             if self.capture_hidden_mode.need_capture():
                 self.hidden_states = self.hidden_states[: len(new_indices)]
             self.verified_id = self.verified_id[: len(new_indices)]
-            self.next_out_cache_loc = self.next_out_cache_loc[: len(new_indices)]
-            self.filtered_out_cache_loc = self.next_out_cache_loc[len(new_indices):]
+            if self.next_out_cache_loc is not None:
+                self.next_out_cache_loc = self.next_out_cache_loc[: len(new_indices)]
+                self.filtered_out_cache_loc = self.next_out_cache_loc[len(new_indices):]
         else:
             # In some paths the scheduler is the first component that removes
             # finished requests, so all per-request fields must be indexed here.

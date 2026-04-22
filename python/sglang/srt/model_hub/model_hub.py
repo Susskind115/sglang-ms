@@ -205,7 +205,7 @@ class ModelHub:
         # model hub
         selected_server_args_list = server_args_list[:]
         model_algorithm = {server_args.model_path: server_args.speculative_algorithm for server_args in selected_server_args_list}
-        target_model_name = server_args_list[-1].model_path 
+        target_model_name = server_args_list[-1].model_path
         model_chain = [server_args.model_path for server_args in selected_server_args_list]
         # model_attr_list = [(server_args.model_path, server_args.speculative_algorithm) for server_args in selected_server_args_list_mock]
 
@@ -335,10 +335,11 @@ class ModelHub:
             self.full_model_ids.append(draft_worker.model_name)
         workers.append(main_model_worker)
         self.full_model_ids.append(main_model_worker.model_name)
+
         device = main_model_worker.model_runner.device
         dtype = main_model_worker.model_runner.dtype
         self.dtype = dtype
-        
+
         self.model_workers = workers
         self.worker_map = {worker.model_name: worker for worker in workers}
         logger.info(f"full_model_ids: {self.full_model_ids}")
