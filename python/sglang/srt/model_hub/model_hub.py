@@ -147,11 +147,6 @@ class ModelHub:
         self.enabled_skip_extend = router_args["enabled_skip_extend"]
         self.switch_thresh = router_args["switch_thresh"]
         self.first_prefill_pass = False
-        # exploration mechanism to break positive-feedback deadlock
-        self._explore_interval = 30
-        self._explore_burst = 2
-        self._explore_count = 0
-        self._explore_remaining = 0
         # logger.info(f"switch_thresh: {self.switch_thresh}")
         # self.mode_switch_enabled = router_args.get("mode_switch_enabled", True)
         # 默认配置
@@ -411,9 +406,9 @@ class ModelHub:
 
         
         self._init_request_prob_storage(
-            main_model_worker.model_runner.device, 
-            main_model_worker.model_runner.dtype, 
-            max_num_reqs
+            main_model_worker.model_runner.device,
+            main_model_worker.model_runner.dtype,
+            max_num_reqs + 1
         )
 
 
@@ -508,7 +503,10 @@ class ModelHub:
                 kv_state.clone() if isinstance(kv_state, torch.Tensor) else kv_state
             )
 
-        warmup_batch_size = 128
+        # Adaptive warmup batch size: 6 warmup batches share the req pool
+        # (2 × bs + 4 × 1), so bs must be ≤ (pool_size - 4) / 2.
+        pool_capacity = getattr(req_pool, 'size', 256)
+        warmup_batch_size = min(128, max(1, (pool_capacity - 10) // 2))
         # warmup_prompt_len = 2048
         # warmup_prompt_len2 = 4096
         batch, token_sequence = self._build_warmup_batch(worker, default_prompt_len=1, default_batch_size=warmup_batch_size)
@@ -1476,24 +1474,6 @@ class ModelHub:
                     f"original={original_chain} forced={selected_chain}"
                 )
 
-        # exploration: periodically force full chain when solver chose shorter chain
-        if selected_chain is not None and self.chain_scheduler is not None:
-            full_ids = self.chain_scheduler.full_model_ids
-            if self._explore_remaining > 0:
-                self._explore_remaining -= 1
-                selected_chain = full_ids[:]
-            elif len(selected_chain) < len(full_ids):
-                self._explore_count += 1
-                if self._explore_count >= self._explore_interval:
-                    self._explore_count = 0
-                    self._explore_remaining = self._explore_burst - 1
-                    selected_chain = full_ids[:]
-                    if get_rank() == 0:
-                        logger.info(
-                            f"[EAGLE3_DEBUG] exploration triggered | "
-                            f"forcing full chain for {self._explore_burst} steps"
-                        )
-
         if selected_chain is not None:
             self._record_selected_chain(selected_chain)
 
@@ -1769,8 +1749,25 @@ class ModelHub:
         return logits_output, next_token_ids, model_worker_batch.bid, 0, can_run_cuda_graph
 
     
+    def _diag_batch_consistency(self, tag, batch):
+        """Log batch consistency at key points. Writes to file to avoid subprocess stderr issues."""
+        if get_rank() != 0:
+            return
+        bs = len(batch.reqs) if batch.reqs else 0
+        rpi_n = batch.req_pool_indices.numel() if batch.req_pool_indices is not None else -1
+        sl_n = batch.seq_lens.numel() if batch.seq_lens is not None else -1
+        if rpi_n != bs or sl_n != bs:
+            import time
+            msg = f"[{time.strftime('%H:%M:%S')}] MISMATCH {tag}: reqs={bs}, rpi={rpi_n}, sl={sl_n}, mode={batch.forward_mode}\n"
+            try:
+                with open("/tmp/diag_batch_trace.log", "a") as f:
+                    f.write(msg)
+            except:
+                pass
+
     def adaptive_spec_forward(self, batch: ScheduleBatch, next_state: str, exec_worker_name: str, last_worker_name:str, sync_model_name_list: List[str]):
         # logger.info(f"adaptive_spec_forward, next_state: {next_state}, last_worker_name: {last_worker_name}, exec_worker_name: {exec_worker_name}")
+        self._diag_batch_consistency(f"enter_{next_state}", batch)
         if get_rank() == 0:
             logger.info(f"current {next_state}")
         specrouter_debug_log(
@@ -1898,9 +1895,11 @@ class ModelHub:
                 if target_worker.model_name == self.model_router.target_model_name and len(verify_output.finished_req_pool_indices) > 0:
                     self.first_prefill_pass = True
 
+            self._diag_batch_consistency("after_verify", batch)
             return logits_output, next_token_ids, model_worker_batch_bid, num_accepted_tokens, can_run_cuda_graph
 
         elif next_state == "draft_extend":
+            self._diag_batch_consistency("draft_extend_entry", batch)
             # 收取目标模型的状态last_worker_name
             # batch = self.state_manager.restore_snapshot(last_worker_name, batch)
             with count_time("target_extend"):
@@ -2372,6 +2371,7 @@ class ModelHub:
                     break
                 with count_time("all_time"):
                     logits_output, next_token_ids, model_worker_batch_bid, num_accepted_tokens, can_run_cuda_graph = self.adaptive_spec_forward(batch, next_state, exec_worker_name, last_worker_name, sync_model_name_list)
+                self._diag_batch_consistency(f"after_{next_state}_return", batch)
                 if (exec_worker_name == self.model_router.target_model_name) and (next_state in ["verify", "autoregressive"]):
                     # ready_to_return
                     logits_output_target = logits_output

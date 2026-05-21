@@ -612,6 +612,7 @@ class Scheduler(
         self.forward_ct = 0
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
+        self.cumulative_generated_tokens = 0
         self.num_prefill_tokens = 0
         self.last_decode_stats_tic = time.perf_counter()
         self.last_prefill_stats_tic = time.perf_counter()
@@ -1933,6 +1934,7 @@ class Scheduler(
                 )
                 self.spec_num_total_forward_ct += batch.batch_size()
                 self.num_generated_tokens += num_accepted_tokens
+                self.cumulative_generated_tokens += num_accepted_tokens
 
             self.true_batch_tracker.record(batch.runtime_step_telemetry)
 
@@ -2272,6 +2274,7 @@ class Scheduler(
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
         ret["true_batch_stats"] = self.true_batch_tracker.snapshot()
+        ret["cumulative_generated_tokens"] = self.cumulative_generated_tokens
         if getattr(self, "model_hub", None) is not None:
             ret["chain_runtime_stats"] = self.model_hub.get_runtime_stats()
         return GetInternalStateReqOutput(

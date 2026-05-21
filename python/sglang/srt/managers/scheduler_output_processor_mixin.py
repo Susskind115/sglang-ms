@@ -194,6 +194,7 @@ class SchedulerOutputProcessorMixin:
             result.can_run_cuda_graph,
         )
         self.num_generated_tokens += len(batch.reqs)
+        self.cumulative_generated_tokens += len(batch.reqs)
 
         if self.enable_overlap:
             logits_output, next_token_ids, can_run_cuda_graph = (

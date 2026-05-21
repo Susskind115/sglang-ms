@@ -134,6 +134,17 @@ class ModelHistory:
         return effective_start_lens, extend_lens
     
     def add_request_idx_count(self, req_pool_indices: torch.Tensor):
+        pool_size = self.request_idx_count.numel()
+        if req_pool_indices.numel() > 0:
+            rpi_max = req_pool_indices.max().item()
+            if rpi_max >= pool_size:
+                with open("/tmp/diag_batch_trace.log", "a") as f:
+                    f.write(f"CHAIN_UTILS-OOB: add_request_idx_count rpi_max={rpi_max} >= pool_size={pool_size}, "
+                            f"rpi={req_pool_indices.tolist()}\n")
+                safe_mask = req_pool_indices < pool_size
+                req_pool_indices = req_pool_indices[safe_mask]
+                if req_pool_indices.numel() == 0:
+                    return
         self.request_idx_count[req_pool_indices] += 1
 
 
@@ -583,7 +594,9 @@ class StateManager:
         # self.accept_token: Optional[torch.Tensor] = None
     
     def set_attr(self, max_req_num: int):
-        self.max_req_num = max_req_num
+        # ReqToTokenPool is allocated with size=max_num_reqs+1, so pool indices
+        # can reach max_num_reqs. Match that here to avoid off-by-one OOB.
+        self.max_req_num = max_req_num + 1
 
     def take_snapshot(
         self,

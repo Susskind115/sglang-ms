@@ -930,6 +930,7 @@ class TpModelWorker:
             seq_lens_backup = batch.seq_lens.clone()
             seq_lens_sum_backup = batch.seq_lens_sum
             req_pool_indices_backup = batch.req_pool_indices.clone()
+            reqs_backup = list(batch.reqs)
             accept_length_backup = batch.spec_info.accept_length.clone()
             out_cache_loc_backup = batch.out_cache_loc.clone()
             return_logprob_backup = batch.return_logprob
@@ -980,6 +981,7 @@ class TpModelWorker:
             batch.seq_lens = seq_lens_backup
             batch.seq_lens_sum = seq_lens_sum_backup
             batch.req_pool_indices = req_pool_indices_backup
+            batch.reqs = reqs_backup
             batch.spec_info.accept_length = accept_length_backup
             batch.return_logprob = return_logprob_backup
             batch.spec_info.hidden_states = logits_output.hidden_states
@@ -1006,6 +1008,7 @@ class TpModelWorker:
         seq_lens_backup = batch.seq_lens.clone()
         seq_lens_sum_backup = batch.seq_lens_sum
         req_pool_indices_backup = batch.req_pool_indices
+        reqs_backup = list(batch.reqs)
         accept_length_backup = batch.spec_info.accept_length.clone()
         out_cache_loc_backup = batch.out_cache_loc.clone()
         return_logprob_backup = batch.return_logprob
@@ -1056,6 +1059,7 @@ class TpModelWorker:
         batch.seq_lens = seq_lens_backup
         batch.seq_lens_sum = seq_lens_sum_backup
         batch.req_pool_indices = req_pool_indices_backup
+        batch.reqs = reqs_backup
         batch.spec_info.accept_length = accept_length_backup
         batch.return_logprob = return_logprob_backup
         batch.spec_info.accept_length_cpu = accept_length_backup.tolist()
@@ -1287,12 +1291,40 @@ class TpModelWorker:
         # Forward with the target model and get hidden states.
         # We need the full hidden states to prefill the KV cache of the draft model.
 
+        # [DIAG] Check batch state before get_model_worker_batch in forward_target_extend
+        _diag_bs = len(batch.reqs) if batch.reqs else 0
+        _diag_rpi = batch.req_pool_indices
+        _diag_sl = batch.seq_lens
+        if _diag_rpi is not None and _diag_sl is not None:
+            _rpi_n = _diag_rpi.numel()
+            _sl_n = _diag_sl.numel()
+            if _rpi_n != _diag_bs or _sl_n != _diag_bs:
+                import time as _t
+                _msg = f"[{_t.strftime('%H:%M:%S')}] EXTEND-INCON: bs={_diag_bs}, rpi={_rpi_n}, sl={_sl_n}, mode={batch.forward_mode}\n"
+                try:
+                    with open("/tmp/diag_batch_trace.log", "a") as _f:
+                        _f.write(_msg)
+                except:
+                    pass
+            if _diag_rpi.numel() > 0:
+                _pool_sz = batch.req_to_token_pool.size if batch.req_to_token_pool else -1
+                _rmax = _diag_rpi.max().item()
+                if _pool_sz > 0 and _rmax >= _pool_sz:
+                    import time as _t
+                    _msg = f"[{_t.strftime('%H:%M:%S')}] EXTEND-POOL-OOB: max={_rmax} vs pool={_pool_sz}, bs={_diag_bs}\n"
+                    try:
+                        with open("/tmp/diag_batch_trace.log", "a") as _f:
+                            _f.write(_msg)
+                    except:
+                        pass
+        # [/DIAG]
+
         model_worker_batch = batch.get_model_worker_batch()
         # model_worker_batch.capture_hidden_mode = CaptureHiddenMode.NULL
         # TODO: one static config
         # if batch.spec_info.capture_hidden_mode.need_capture():
         #     model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        
+
         if prefill_logits_num > 0:
             model_worker_batch.return_logprob = True
             seq_lens = model_worker_batch.extend_seq_lens

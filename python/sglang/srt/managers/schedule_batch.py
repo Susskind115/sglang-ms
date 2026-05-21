@@ -1534,6 +1534,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.seq_lens, last_loc
             )
 
+        # [DIAG] Bounds check before req_to_token_pool.write in prepare_for_decode
+        _pool_size = self.req_to_token_pool.size
+        _max_ctx = self.req_to_token_pool.max_context_len
+        _rpi = self.req_pool_indices
+        _locs = locs
+        _rpi_max = _rpi.max().item() if _rpi.numel() > 0 else -1
+        _locs_max = _locs.max().item() if _locs.numel() > 0 else -1
+        if _rpi_max >= _pool_size or _locs_max >= _max_ctx:
+            import time as _t
+            _msg = f"[{_t.strftime('%H:%M:%S')}] DECODE-OOB: rpi_max={_rpi_max} vs pool={_pool_size}, locs_max={_locs_max} vs ctx={_max_ctx}, bs={len(self.reqs)}\n"
+            try:
+                with open("/tmp/diag_batch_trace.log", "a") as _f:
+                    _f.write(_msg)
+            except:
+                pass
+        # [/DIAG]
+
         self.req_to_token_pool.write(
             (self.req_pool_indices, locs), self.out_cache_loc.to(torch.int32)
         )
@@ -1687,6 +1704,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def get_model_worker_batch(self) -> ModelWorkerBatch:
+        # [DIAG] Pre-sync bounds check
+        if self.req_pool_indices is not None and self.req_pool_indices.numel() > 0:
+            _rpi_max = self.req_pool_indices.max().item()
+            _pool_size = self.req_to_token_pool.size if hasattr(self, 'req_to_token_pool') and self.req_to_token_pool is not None else -1
+            _bs = len(self.reqs) if self.reqs else 0
+            _rpi_len = self.req_pool_indices.numel()
+            _sl_len = self.seq_lens.numel() if self.seq_lens is not None else 0
+            if _rpi_len != _bs or (_pool_size > 0 and _rpi_max >= _pool_size):
+                import time as _t
+                _msg = f"[{_t.strftime('%H:%M:%S')}] GETBATCH-OOB: rpi_max={_rpi_max} vs pool={_pool_size}, rpi_len={_rpi_len} vs bs={_bs}, sl_len={_sl_len}, mode={self.forward_mode}\n"
+                try:
+                    with open("/tmp/diag_batch_trace.log", "a") as _f:
+                        _f.write(_msg)
+                except:
+                    pass
+        # [/DIAG]
+
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:

@@ -100,14 +100,17 @@ class EagleDraftInput:
         self,
         batch: ScheduleBatch,
         speculative_num_steps: int
-    ):  
+    ):
         assert len(self.drafted_id) == len(batch.out_cache_loc)
         accept_length_cpu = batch.spec_info.accept_length_cpu
         batch.extend_lens = [x + 1 for x in accept_length_cpu]
         batch.extend_num_tokens = sum(batch.extend_lens)
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
-        # batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend-1
-        batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
+        new_rpi = batch.spec_info.req_pool_indices_for_draft_extend
+        if len(batch.reqs) != new_rpi.numel():
+            keep_set = set(new_rpi.tolist())
+            batch.reqs = [r for r in batch.reqs if r.req_pool_idx in keep_set]
+        batch.req_pool_indices = new_rpi
 
         self.positions = torch.empty_like(self.drafted_id, dtype=torch.long)
         new_verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
@@ -149,8 +152,11 @@ class EagleDraftInput:
         batch.extend_lens = [x + 1 for x in accept_length_cpu]
         batch.extend_num_tokens = sum(batch.extend_lens)
         batch.seq_lens = seq_lens
-        # batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend-1
-        batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
+        new_rpi = batch.spec_info.req_pool_indices_for_draft_extend
+        if len(batch.reqs) != new_rpi.numel():
+            keep_set = set(new_rpi.tolist())
+            batch.reqs = [r for r in batch.reqs if r.req_pool_idx in keep_set]
+        batch.req_pool_indices = new_rpi
 
         self.positions = torch.empty_like(drafted_id, dtype=torch.long)
         # self.positions = torch.full_like(drafted_id, -1, dtype=torch.long)
@@ -319,7 +325,11 @@ class EagleDraftInput:
         #     logger.info(f" batch.req_pool_indices: {batch.req_pool_indices}")
         #     logger.info(f" batch.spec_info.req_pool_indices_for_draft_extend: {batch.spec_info.req_pool_indices_for_draft_extend}")
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend.clone()
-        batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend.clone()
+        new_rpi = batch.spec_info.req_pool_indices_for_draft_extend.clone()
+        if len(batch.reqs) != new_rpi.numel():
+            keep_set = set(new_rpi.tolist())
+            batch.reqs = [r for r in batch.reqs if r.req_pool_idx in keep_set]
+        batch.req_pool_indices = new_rpi
         self.accept_length = batch.spec_info.accept_length_for_draft_extend.clone()
         seq_lens_cpu = batch.seq_lens.tolist()
         # if torch.distributed.get_rank() == 0:
@@ -375,7 +385,11 @@ class EagleDraftInput:
         batch.extend_lens = [x + 1 for x in accept_length_cpu]
         batch.extend_num_tokens = sum(batch.extend_lens)
         batch.seq_lens = seq_lens
-        batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend.clone()
+        new_rpi = batch.spec_info.req_pool_indices_for_draft_extend.clone()
+        if len(batch.reqs) != new_rpi.numel():
+            keep_set = set(new_rpi.tolist())
+            batch.reqs = [r for r in batch.reqs if r.req_pool_idx in keep_set]
+        batch.req_pool_indices = new_rpi
         # if hidden_states is not None:
         #     batch.spec_info.hidden_states = hidden_states.clone()
 
@@ -835,9 +849,14 @@ class EagleVerifyInput:
         
         # logger.info(f"batch.spec_info.next_out_cache_loc {batch.spec_info.next_out_cache_loc}")
         # from draft_input to verify_input
-        out_cache_loc, next_out_cache_loc = shift_right_fixed(batch.out_cache_loc, batch.spec_info.next_out_cache_loc, self.draft_token_num)
-        batch.out_cache_loc = out_cache_loc
-        self.next_out_cache_loc = next_out_cache_loc
+        if batch.spec_info.next_out_cache_loc is not None:
+            out_cache_loc, next_out_cache_loc = shift_right_fixed(batch.out_cache_loc, batch.spec_info.next_out_cache_loc, self.draft_token_num)
+            batch.out_cache_loc = out_cache_loc
+            self.next_out_cache_loc = next_out_cache_loc
+        else:
+            # next_out_cache_loc may be None during submit_flag=True reconfig path
+            # where draft step hasn't initialized it yet
+            self.next_out_cache_loc = None
     
 
         bs = batch.batch_size()
@@ -1167,7 +1186,7 @@ class EagleVerifyInput:
             draft_input.seq_lens_for_draft_extend = batch.seq_lens.clone()
             draft_input.req_pool_indices_for_draft_extend = batch.req_pool_indices.clone()
             draft_input.accept_length_for_draft_extend = accept_length.clone()
-            draft_input.next_out_cache_loc = batch.spec_info.next_out_cache_loc.clone()
+            draft_input.next_out_cache_loc = batch.spec_info.next_out_cache_loc.clone() if batch.spec_info.next_out_cache_loc is not None else None
 
             return EagleVerifyOutput(
                 draft_input=draft_input,
@@ -1233,7 +1252,7 @@ class EagleVerifyInput:
                         batch.req_pool_indices.clone()
                     )
                     draft_input.accept_length_for_draft_extend = accept_length.clone()
-                    draft_input.next_out_cache_loc = batch.spec_info.next_out_cache_loc.clone()
+                    draft_input.next_out_cache_loc = batch.spec_info.next_out_cache_loc.clone() if batch.spec_info.next_out_cache_loc is not None else None
             batch.out_cache_loc = batch.out_cache_loc[new_accept_index]
             # if torch.distributed.get_rank() == 0:
             #     logger.info(f"verify has_finished out_cache_loc: {batch.out_cache_loc}")
